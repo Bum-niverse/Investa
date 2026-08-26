@@ -1,0 +1,88 @@
+# Codex App Server 연동
+
+기준일: 2026-08-21
+
+## 현재 구현
+
+Investa의 직원 상세 패널에서 업무를 지시하면 Tauri Rust가 로컬 `codex app-server`에 JSONL 요청을 보내고 응답 delta를 대화창에 실시간 표시한다. 본부장은 자유형 답변 대신 안건 분류와 최종 종합의 구조화 계약을 사용한다.
+
+퀀트 논문 연구원은 예외적으로 자유형 delta를 화면에 직접 표시하지 않는다. `turn/start.outputSchema`로 `ResearchReport`를 생성하고 Rust 검증을 통과한 요약과 백테스트 상태만 표시한다. 본부장 회의도 같은 경계를 사용해 부서별 `DepartmentReport`와 본부장 `MeetingSynthesis`를 Rust에서 다시 검증한다. 그 밖의 42명에게 직접 지시하면 서버 소유 역할 카탈로그에서 이름·범위·초점을 다시 주입하고 `RoleReport`만 허용한다. 개별 소견은 다른 역할, 부서 종합, 전체 분석, 백테스트 결과와 주문 후보를 대신할 수 없으며 분석 보관함에 별도 불변 기록으로 저장된다. 부장·실장의 `suggestedAssignments`는 서버의 직속 직원 allowlist로 제한한다. 화면은 예상 호출 인원과 업무·사유를 먼저 보여주며 사용자가 `부서 업무 지시`를 눌러야 각 직원의 별도 turn이 시작된다. 일반 직원은 이 배열을 비워야 한다.
+
+승인된 부서 업무는 배정된 직원별 `RoleReport` 또는 퀀트 논문 연구원의 검증 결과와 오류·취소를 실제 이벤트로 집계한다. 모든 직원이 종료된 뒤에만 부장에게 집계 자료를 전달하고 `DepartmentReport`를 생성한다. 부서 ID와 직원 ID 집합이 승인 당시 배정 목록과 정확히 일치해야 완료되며, 결과는 분석 보관함에 저장한다. 부서 보고가 완성돼도 본부장 회의, 주문 후보와 실주문으로 자동 승격하지 않는다.
+
+국장·미장 분석 역할은 Codex turn 전에 `toss_analysis_snapshot`을 호출한다. 자연어 요청에 포함된 종목명·별칭·티커를 토스 카탈로그에서 단일 종목으로 확정하고, 완료된 수정주가 일봉만 사용해 가격·거래량과 결정론적 기술지표를 계산한다. 기준 시각은 마지막 완료 봉의 종료 시각이며 미완성 봉과 이후 데이터는 제외한다. 부장 제안으로 시작된 직속 직원들은 부장 요청 당시 스냅샷을 재사용해 서로 다른 수집 시각의 자료가 섞이지 않게 한다. 여러 시장 종목이 함께 감지되거나 종목을 확정하지 못하면 스냅샷을 만들지 않고 Codex에 결측 사실만 전달한다.
+
+미장 종목은 SEC 연락처가 설정된 경우 `company_tickers.json`으로 ticker→CIK를 확정하고 Company Facts와 Submissions를 결합한다. SEC 제출 시각이 날짜보다 세밀하지 않은 항목을 고려해 재무·공시는 보수적으로 `filed < asOfDate`를 만족해야 하고 재무 관측치의 `periodEnd <= asOfDate`도 검사한다. 재무값에는 단위·기간·제출일·양식·accession number·회계연도·회계기간·frame을 전달한다. 공시는 최대 20건의 양식·제출일·보고기간·공시 항목·원문 index를 제공한다. 공시 원문 본문을 실행하거나 지시로 취급하지 않으며, Submissions 메타데이터를 언론 뉴스나 감성 데이터로 해석하지 않는다. SEC 오류는 가격 스냅샷 전체를 실패시키지 않고 해당 재무·공시만 `provider_error`로 닫는다. 국장 재무·공시와 언론 뉴스·수급 데이터는 공식 공급자 연결 전까지 `provider_not_connected`이며 추정하지 않는다.
+
+```text
+React 직원 패널
+  → Tauri command
+  → Rust CodexBridge
+  → codex app-server --stdio
+  → ChatGPT 구독 인증
+```
+
+- 설치 버전: `codex-cli 0.149.0`
+- 기본 설치 위치: `%LOCALAPPDATA%\Investa\codex-cli`
+- 인증: 기존 Codex의 ChatGPT 로그인 재사용
+- 전송: 로컬 stdio JSONL, 외부 listening port 없음
+- thread: 직원별로 분리하고 SQLite에 ID를 저장해 앱 재시작 후 `thread/resume`
+- sandbox: `read-only`
+- network access: OFF
+- approval policy: `never`
+- 주문·증권사 자격증명·위험 정책 변경 도구: 제공하지 않음
+
+`INVESTA_CODEX_PATH` 환경변수로 별도 `codex.exe`를 지정할 수 있다. 환경변수가 없으면 Investa 사용자 설치 폴더 아래의 실행 파일만 제한된 깊이로 탐색한다. WindowsApps의 데스크톱 앱 번들은 후보로 사용하지 않는다.
+
+## 이벤트와 UI 상태
+
+- 업무 대기
+- `turn/started`: 요청 전달
+- 첫 구조화 응답 조각 수신: 응답 생성 중
+- 완료 응답 수신 후 Rust 계약 파싱: 계약 검증 중
+- 계약 검증 완료: 보고 완료
+
+App Server는 토큰 단위의 정확한 잔여 작업량을 제공하지 않으므로 회의와 구조화 연구 업무에는 추정 백분율을 표시하지 않는다. 화면은 실제 이벤트와 계약 검증 단계만 표시하며, 완료만 확정 상태다.
+
+회의는 본부장 분류 1회가 안건을 작업 단위로 나누고 관련 부서만 선택한 뒤, 일반 안건은 최대 3개 부서, 중요 안건은 최대 7개 부서와 본부장 종합 1회를 실행한다. 전체 호출 상한은 각각 5회와 9회이며 동시 부서 호출은 2개다. 각 부서장 호출 하나가 소속 역할별 소견을 배열로 반환하므로 직원별 독립 Codex 작업률을 뜻하지 않는다. Rust는 허용 부서 ID와 필수 안전 부서를 다시 검증하고, 분류 실패 시 임의 부서를 소집하지 않는다. 중단 시 현재 실행 중인 turn을 실제로 interrupt하고 늦게 도착한 종료 이벤트가 복귀 상태를 덮거나 취소된 분류가 회의를 다시 시작하지 않게 폐기한다.
+
+자유형 응답은 Rust 이벤트 경계와 React 렌더링 경계에서 각각 32KB급 표시 상한을 적용한다. 한도를 넘긴 delta는 한 번만 생략 안내를 표시하고 이후 스트림을 버려 장문 Markdown이 WebView 메모리를 고갈시키지 않게 한다.
+
+## 보안과 개인정보 경계
+
+- 사용자가 직원 대화창에 입력한 업무 요청과 역할 설명은 OpenAI Codex 서비스로 전송된다.
+- 계정 토큰은 Codex CLI가 관리하며 React, Investa DB와 로그에 복사하지 않는다.
+- 계정 응답 중 이메일 같은 개인정보는 UI에 표시하거나 Investa 로그에 기록하지 않는다.
+- `api_key`, `client_secret`, `access_token`, `Authorization: Bearer` 등 흔한 자격증명 표식이 업무 요청에 포함되면 전송 전에 거부한다.
+- App Server가 예상하지 않은 승인 요청을 보내면 Investa는 자동 승인하지 않고 거부한다.
+- 현재 thread는 파일 읽기만 가능하고 네트워크·파일 수정·명령 승인·주문 권한이 없다.
+- `account/rateLimits/read` 결과에서 사용률·창 길이·초기화 시각만 표시하고 계정 개인정보는 보관하지 않는다.
+- 실행 중인 직원의 취소 버튼은 서버에 해당 직원의 정확한 `threadId`·`turnId`로 `turn/interrupt`만 보낸다. 취소 요청을 기록한 시점부터 해당 turn의 후속 delta는 폐기하고, 완료 이벤트가 경합하더라도 UI에는 취소로 확정한다.
+
+## 검증 결과
+
+실제 App Server로 다음 순서를 검증했다.
+
+1. `initialize` / `initialized`
+2. `account/read`에서 ChatGPT 로그인 확인
+3. `thread/start`에서 `readOnly`, `networkAccess: false`, `approvalPolicy: never` 확인
+4. `turn/start`
+5. 한글 `item/agentMessage/delta` 연속 수신
+6. `turn/completed` 수신
+7. Investa 실행 프로세스의 자식으로 별도 설치한 `codex.exe app-server --stdio`가 시작되는지 확인
+8. 퀀트 논문 연구원의 구조화 보고서 → 서버 검증 → 토스 일봉 백테스트 `DONE` 확인
+9. `account/rateLimits/read` 실제 응답을 직원 패널에 표시
+10. 직원별 thread ID SQLite 저장과 재시작 시 `thread/resume` 경로 구현
+11. `turn/interrupt` 계약과 취소 완료 `status: interrupted` 이벤트 처리 구현
+12. 공개 GitHub 근거를 사용한 연구 보고서·토스 탐색 백테스트를 SQLite에 저장한 뒤 앱을 재시작해 기록과 직원별 대화 맥락이 이어지는지 확인
+13. 300개 지표 장문 응답을 시작한 뒤 UI에서 취소해 유휴 상태 복귀, 후속 delta 차단과 WebView 메모리 안정성을 확인
+14. 부서 보고와 본부장 종합 JSON 계약의 정상·오류 입력을 Rust 단위 테스트로 검증
+15. 본부장 안건 분류 스키마의 허용 부서·필수 안전 부서·중복 제거·최대 7개 제한을 Rust 단위 테스트로 검증
+16. 국내·미국 주식 분석과 비트코인 내부 모의 자동매매를 합친 안건이 리서치·전략운용·리스크관리·매매운영·디지털자산 5개 부서만 소집하고 투자공학·홍보·준법 부서를 제외하는지 실제 Tauri 화면에서 확인
+17. 중요 안건을 실제 App Server로 끝까지 실행해 완료된 부서장부터 본부장실에 복귀하고, 5개 부서장이 모두 도착한 뒤에만 본부장 종합 보고가 시작되는지 확인
+18. 여러 시장·자산을 포괄해 단일 종목이 정해지지 않은 안건은 백테스트 종목을 임의 생성하지 않고 `required=false`, `symbol=null`, `strategy=null`인 진입 보류·후보 미등록으로 종료하며, 보고 확인 뒤 `WORKING 00`과 회의실 대기 상태로 전원 복귀하는지 실제 Tauri 화면에서 확인
+
+## 다음 범위
+
+- 한도 도달 상태의 상세 안내와 자동 재시도 금지
+- 일반·중요 회의를 여러 시간 반복 실행하는 장시간 안정성 검수

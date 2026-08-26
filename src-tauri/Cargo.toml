@@ -1,0 +1,36 @@
+[package]
+name = "investa"
+version = "0.1.0"
+description = "Local-first agentic paper-trading desktop application"
+authors = ["Bum-niverse"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "investa_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.13.4", default-features = false, features = ["native-tls-no-alpn", "json", "form", "query"] }
+keyring = { version = "4.1.6", default-features = false, features = ["v1", "windows-native-keyring-store"] }
+rusqlite = { version = "0.40.2", features = ["bundled", "fallible_uint"] }
+base64 = "0.22"
+hmac = "0.12"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+grammers-client = { version = "0.10.0", default-features = false }
+grammers-session = { version = "0.10.0", default-features = false, features = ["serde"] }

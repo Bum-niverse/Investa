@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" shape-rendering="crispEdges">
+  <g id="investa-pixel-employee">
+    <path fill="#2c2521" d="M17 4h30v11H17z"/>
+    <path fill="#47382f" d="M20 7h24v8H20z"/>
+
+    <path fill="#3a2d27" d="M18 15h28v22H18z"/>
+    <path fill="#d7aa7f" d="M21 18h22v16H21z"/>
+    <path fill="#322b28" d="M24 22h3v3h-3zm13 0h3v3h-3z"/>
+
+    <path fill="#202826" d="M15 37h34v18H15z"/>
+    <path fill="#26332f" d="M18 37h28v15H18z"/>
+    <path fill="#35443f" d="M18 37h4v15h-4z"/>
+    <path fill="#1d2825" d="M42 37h4v15h-4z"/>
+    <path fill="#e5e2d8" d="M26 37h12l-6 7z"/>
+    <path fill="#52635c" d="M20 38h8l-5 9h-3zm24 0h-8l5 9h3z"/>
+    <path fill="#b9df37" d="M30 40h4l1 3-1 9h-4l-1-9z"/>
+
+    <path fill="#1f2927" d="M21 55h9v7h-9zm13 0h9v7h-9z"/>
+  </g>
+</svg>
