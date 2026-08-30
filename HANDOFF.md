@@ -176,7 +176,7 @@ C:\Users\Kim Beom soo\OneDrive\Documents\ProjectStudio
 Investa ProjectStudio 상태:
 
 - project ID: `36e87491-74a8-48ca-a7b8-30fa6ccea131`
-- PRD revision: `162`
+- PRD revision: `168`
 - 기능명세: 279개 (`done` 222, `in_progress` 51, `planned` 6)
 - 자동매매·모델 고정 로드맵: `feat-auto-roadmap`과 하위 기능. 전략 승격·자동 배치·롤백, `PIT 데이터 매니페스트·ML worker 계약`, `LightGBM·XGBoost 기준 worker`, `OOS 원시 확률 Rust 재계산`, `PIT 데이터·라벨 빌더`, `XGBoost shard-aware 외부 메모리 worker`를 완료했다. `공식 실제시장 ML 기준 검증`은 730일·1h·4h·1d의 48개 모델과 fold별 과거 기준 레짐·비용·funding 스트레스를 마쳤지만 3~5년·분봉·주식·실계정 비용·호가 검증이 남아 `in_progress`이며, ML 모델 개발 상위 항목도 계속 진행 중이다.
 - 전략 판단·실행 주기 계약: `feat-auto-cadence-contract`, 완료 기준 4/4. 완료 봉 플러그인의 tick 판단과 interval 불일치를 거부하며 실주문은 잠겨 있다.
