@@ -2155,7 +2155,7 @@ dependencies = [
  "futures-util",
  "grammers-client",
  "grammers-session",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "keyring",
  "reqwest",
  "rusqlite",
