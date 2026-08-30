@@ -13,6 +13,11 @@ dist-ssr
 *.local
 __pycache__/
 *.py[cod]
+.venv*/
+.pytest_cache/
+ml-worker/artifacts/
+ml-worker/runs/
+docs/assets/investa-overview-frames/
 
 # Local credentials and environment overrides
 .env

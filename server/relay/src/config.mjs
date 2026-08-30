@@ -44,6 +44,7 @@ export function loadConfig(env = process.env) {
     maxClockSkewSeconds: boundedInteger(env.MAX_CLOCK_SKEW_SECONDS, 300, 30, 900),
     leaseSeconds: boundedInteger(env.LEASE_SECONDS, 90, 30, 600),
     maxRequestsPerMinute: boundedInteger(env.MAX_REQUESTS_PER_MINUTE, 60, 10, 600),
+    jobRetentionHours: boundedInteger(env.JOB_RETENTION_HOURS, 24, 1, 168),
     firestoreDatabase: env.FIRESTORE_DATABASE?.trim() || "(default)",
   });
 }

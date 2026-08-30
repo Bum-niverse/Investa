@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { verifyDesktopRequest, verifyTelegramSecret, sha256Hex } from "./security.mjs";
+import { containsSecretMarker, verifyDesktopRequest, verifyTelegramSecret, sha256Hex } from "./security.mjs";
 
 const jsonResponse = (status, payload) => ({ status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }, body: JSON.stringify(payload) });
 const validDeviceId = (value) => typeof value === "string" && /^[A-Za-z0-9_.:-]{1,128}$/.test(value);
@@ -8,6 +8,12 @@ class RateLimiter {
   constructor(limit) { this.limit = limit; this.buckets = new Map(); }
   allow(key, nowMs) {
     const minute = Math.floor(nowMs / 60_000);
+    if (this.buckets.size > 2_048) {
+      for (const [bucketKey, bucket] of this.buckets) {
+        if (bucket.minute < minute) this.buckets.delete(bucketKey);
+      }
+      if (this.buckets.size > 2_048 && !this.buckets.has(key)) return false;
+    }
     const current = this.buckets.get(key);
     if (!current || current.minute !== minute) { this.buckets.set(key, { minute, count: 1 }); return true; }
     current.count += 1;
@@ -59,8 +65,12 @@ export function createRelayApp({ config, repository, telegram, now = Date.now })
       if (!/^-?\d{1,31}$/.test(chatId) || instruction.length === 0 || [...instruction].length > 4_000) {
         return jsonResponse(400, { error: "invalid_instruction" });
       }
+      if (containsSecretMarker(instruction)) {
+        return jsonResponse(400, { error: "sensitive_instruction" });
+      }
       const jobId = `telegram-${update.update_id}`;
       const createdAtMs = now();
+      const expiresAtMs = createdAtMs + config.jobRetentionHours * 3_600_000;
       const created = await repository.createOnce("relay_jobs", jobId, {
         jobId,
         sourceRequestId: `update:${update.update_id}`,
@@ -70,6 +80,8 @@ export function createRelayApp({ config, repository, telegram, now = Date.now })
         status: "queued",
         createdAtMs,
         updatedAtMs: createdAtMs,
+        expiresAtMs,
+        expiresAt: new Date(expiresAtMs),
       });
       if (created) await telegram.sendMessage(chatId, "Investa가 지시를 안전한 작업 큐에 등록했습니다. 위험 작업은 PC에서 다시 승인해야 합니다.");
       return jsonResponse(200, { ok: true, duplicate: !created });
@@ -102,6 +114,9 @@ export function createRelayApp({ config, repository, telegram, now = Date.now })
       try { payload = JSON.parse(request.body); } catch { return jsonResponse(400, { error: "invalid_json" }); }
       if (!validDeviceId(payload.deviceId) || !["accepted", "awaiting_local_approval", "approved", "rejected", "cancelled", "completed", "failed"].includes(payload.status) || typeof payload.resultText !== "string") {
         return jsonResponse(400, { error: "invalid_result" });
+      }
+      if ([...payload.resultText].length > 12_000 || containsSecretMarker(payload.resultText)) {
+        return jsonResponse(400, { error: "sensitive_or_oversized_result" });
       }
       const jobId = resultMatch[1];
       const current = await repository.get("relay_jobs", jobId);

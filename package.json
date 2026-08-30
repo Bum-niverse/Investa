@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "test:frontend": "node --experimental-strip-types --test scripts/workflowRecovery.test.ts scripts/analysisMarket.test.ts scripts/technicalChartEvidence.test.ts",
+    "test:frontend": "node --experimental-strip-types --test scripts/workflowRecovery.test.ts scripts/analysisMarket.test.ts scripts/analysisSnapshotRouting.test.ts scripts/technicalChartEvidence.test.ts scripts/connectionStatus.test.ts scripts/connectionRefresh.test.ts scripts/marketStreams.test.ts scripts/meetingEvidence.test.ts scripts/shadowSoak.test.ts",
+    "security:audit": "python scripts/security_audit.py",
     "preview": "vite preview",
     "tauri": "tauri"
   },

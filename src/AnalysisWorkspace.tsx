@@ -290,8 +290,8 @@ export function AnalysisWorkspace({ refreshToken }: { refreshToken: number }) {
 
   useEffect(() => {
     const config = detail?.record.config;
-    const candidate = detail?.record.report?.strategyCandidate as ({ entrySignal?: { fastWindow?: number; slowWindow?: number } } | undefined);
-    if (!config || !candidate?.entrySignal) { setCloneDraft(null); setComparison(null); setWalkForward(null); setWalkForwardHistory([]); return; }
+    const candidate = detail?.record.report?.strategyCandidate as ({ entrySignal?: { type?: string; fastWindow?: number; slowWindow?: number } } | undefined);
+    if (!config || candidate?.entrySignal?.type !== "moving_average_cross") { setCloneDraft(null); setComparison(null); setWalkForward(null); setWalkForwardHistory([]); return; }
     setCloneDraft({
       fastWindow: String(candidate.entrySignal.fastWindow ?? 5), slowWindow: String(candidate.entrySignal.slowWindow ?? 20),
       initialCashMinor: String(config.initialCashMinor), orderQuantity: String(config.orderQuantity),

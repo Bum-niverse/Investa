@@ -602,6 +602,20 @@ pub fn sec_connection_status() -> Result<SecConnectionStatus, String> {
 }
 
 #[tauri::command]
+pub async fn sec_connection_probe(
+    bridge: State<'_, SecFundamentalsBridge>,
+) -> Result<SecConnectionStatus, String> {
+    let contact =
+        load_contact()?.ok_or_else(|| "SEC 요청 연락처를 먼저 등록해 주세요.".to_owned())?;
+    bridge.load_tickers(&contact).await?;
+    Ok(SecConnectionStatus {
+        configured: true,
+        connected: true,
+        message: "SEC 공식 종목 식별자 조회를 확인했습니다.".to_owned(),
+    })
+}
+
+#[tauri::command]
 pub async fn sec_save_contact(
     request: SecContactRequest,
     bridge: State<'_, SecFundamentalsBridge>,

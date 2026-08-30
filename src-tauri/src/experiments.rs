@@ -347,6 +347,18 @@ fn execute_clone(
     let suffix = Uuid::new_v4().simple().to_string();
     let cloned_experiment_id = format!("experiment-clone-{}", &suffix[..16]);
     let mut report = source.report.clone();
+    if !matches!(
+        (
+            &report.strategy_candidate.entry_signal,
+            &report.strategy_candidate.exit_signal
+        ),
+        (
+            SignalSpec::MovingAverageCross { .. },
+            SignalSpec::MovingAverageCross { .. }
+        )
+    ) {
+        return Err("현재 복제 실험의 빠른·느린 기간 편집은 이동평균 교차 플러그인만 지원합니다. 다른 플러그인은 원본 파라미터를 보존한 Walk-forward 검증을 사용해 주세요.".to_owned());
+    }
     report.trace_id = format!("trace-clone-{}", &suffix[..16]);
     report.strategy_candidate.strategy_id = format!("strategy-clone-{}", &suffix[..16]);
     report.strategy_candidate.entry_signal = SignalSpec::MovingAverageCross {
@@ -1294,10 +1306,12 @@ fn execute_walk_forward(
             .map_err(|error| format!("전략 실험 횟수를 조회하지 못했습니다: {error}"))?;
         (usize::try_from(count).unwrap_or(usize::MAX), now_ms()?)
     };
-    let slow_window = match source.report.strategy_candidate.entry_signal {
-        SignalSpec::MovingAverageCross { slow_window, .. } => slow_window,
-    };
-    let minimum_segment = slow_window.saturating_add(2);
+    let required_history =
+        crate::strategy_plugins::minimum_history(&source.report.strategy_candidate.entry_signal)
+            .max(crate::strategy_plugins::minimum_history(
+                &source.report.strategy_candidate.exit_signal,
+            ));
+    let minimum_segment = required_history.saturating_add(1);
     let initial_training_bar_count = source.backtest_bars.len() / 2;
     let remaining = source
         .backtest_bars
@@ -1307,10 +1321,10 @@ fn execute_walk_forward(
         || remaining < minimum_segment.saturating_mul(request.fold_count)
     {
         return Err(format!(
-            "{}개 OOS 구간을 만들 가격봉이 부족합니다. 현재 {}봉, 느린 이평 {}봉 기준 최소 {}봉이 필요합니다.",
+            "{}개 OOS 구간을 만들 가격봉이 부족합니다. 현재 {}봉, 전략 플러그인 필요 이력 {}봉 기준 최소 {}봉이 필요합니다.",
             request.fold_count,
             source.backtest_bars.len(),
-            slow_window,
+            required_history,
             minimum_segment.saturating_mul(request.fold_count + 1)
         ));
     }

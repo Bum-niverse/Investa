@@ -11,6 +11,9 @@ use uuid::Uuid;
 
 use crate::{
     backtest::{run_backtest, BacktestConfig, BacktestResult, PriceBar},
+    market_data::{
+        public_market_analysis_snapshot, AnalysisSnapshot, AnalysisSnapshotRequest, TossChartBar,
+    },
     paper_account::{execute_shadow_order, ShadowOrderRequest},
     paper_trading,
     persistence::{PersistBacktest, PersistenceBridge},
@@ -56,6 +59,7 @@ pub struct UpbitAccountSnapshot {
     provider: &'static str,
     fetched_at_ms: u64,
     read_only: bool,
+    permission_verified: bool,
     accounts: Vec<UpbitBalance>,
 }
 
@@ -235,7 +239,7 @@ pub async fn upbit_save_credentials(
     Ok(UpbitConnectionStatus {
         configured: true,
         connected: true,
-        message: "읽기 전용 개인계좌 연결을 확인했습니다.".to_owned(),
+        message: "계좌 조회를 확인했습니다. Upbit는 권한 목록 조회 API를 제공하지 않으므로 Open API 관리에서 주문·출금 권한 비활성화를 직접 확인해야 합니다.".to_owned(),
     })
 }
 
@@ -262,6 +266,7 @@ pub async fn upbit_account_snapshot(
             .map_err(|_| "현재 시각을 확인하지 못했습니다.".to_owned())?
             .as_millis() as u64,
         read_only: true,
+        permission_verified: false,
         accounts: fetch_upbit_accounts(&bridge, &credentials).await?,
     })
 }
@@ -275,11 +280,20 @@ impl Default for CryptoMarketBridge {
 }
 
 impl CryptoMarketBridge {
-    pub(crate) async fn fetch_strategy_bars(&self, symbol: &str) -> Result<Vec<PriceBar>, String> {
+    pub(crate) async fn fetch_strategy_bars(
+        &self,
+        symbol: &str,
+        interval: &str,
+    ) -> Result<Vec<PriceBar>, String> {
+        if !matches!(interval, "1m" | "1d") {
+            return Err(
+                "코인 저장 전략 감시는 백테스트와 동일한 1분봉 또는 일봉만 지원합니다.".to_owned(),
+            );
+        }
         let snapshot = fetch_chart_snapshot(
             CryptoChartRequest {
                 symbol: symbol.to_owned(),
-                interval: "1d".to_owned(),
+                interval: interval.to_owned(),
                 count: 200,
             },
             self,
@@ -420,6 +434,26 @@ fn validate_market(value: &str) -> Result<String, String> {
     Ok(market)
 }
 
+fn resolve_analysis_market(query: &str) -> Result<String, String> {
+    let normalized = query.trim().to_ascii_uppercase();
+    if let Some(market) = normalized
+        .split(|character: char| !(character.is_ascii_alphanumeric() || character == '-'))
+        .find(|token| token.starts_with("KRW-") && token.len() >= 7)
+    {
+        return validate_market(market);
+    }
+    if normalized.contains("비트코인") || normalized.contains("BTC") {
+        return Ok("KRW-BTC".to_owned());
+    }
+    if normalized.contains("이더리움") || normalized.contains("ETH") {
+        return Ok("KRW-ETH".to_owned());
+    }
+    if normalized.contains("리플") || normalized.contains("XRP") {
+        return Ok("KRW-XRP".to_owned());
+    }
+    Err("분석 요청에서 업비트 원화 마켓을 확정하지 못했습니다. 예: KRW-BTC".to_owned())
+}
+
 fn krw_minor(value: f64) -> Result<u64, String> {
     if !value.is_finite() || value <= 0.0 || value > u64::MAX as f64 {
         return Err("업비트 가격 응답이 지원 범위를 벗어났습니다.".to_owned());
@@ -549,6 +583,14 @@ async fn fetch_chart_snapshot(
     })
 }
 
+fn validate_research_interval(interval: &str) -> Result<(), String> {
+    if matches!(interval, "1m" | "1d") {
+        Ok(())
+    } else {
+        Err("코인 전략 검증 주기는 1분봉 또는 일봉이어야 합니다.".to_owned())
+    }
+}
+
 #[tauri::command]
 pub async fn upbit_chart_snapshot(
     request: CryptoChartRequest,
@@ -557,15 +599,81 @@ pub async fn upbit_chart_snapshot(
     fetch_chart_snapshot(request, &bridge).await
 }
 
+async fn fetch_upbit_analysis_snapshot(
+    request: AnalysisSnapshotRequest,
+    bridge: &CryptoMarketBridge,
+) -> Result<AnalysisSnapshot, String> {
+    if request.query.trim().is_empty()
+        || request.query.chars().count() > 500
+        || request.query.chars().any(char::is_control)
+    {
+        return Err("업비트 분석 요청은 한 줄 1자 이상 500자 이하여야 합니다.".to_owned());
+    }
+    if !(60..=200).contains(&request.count) {
+        return Err("업비트 분석 스냅샷 캔들은 60개에서 200개 사이여야 합니다.".to_owned());
+    }
+    let market = resolve_analysis_market(&request.query)?;
+    let snapshot = fetch_chart_snapshot(
+        CryptoChartRequest {
+            symbol: market.clone(),
+            interval: "1d".to_owned(),
+            count: request.count,
+        },
+        bridge,
+    )
+    .await?;
+    let bars = snapshot
+        .bars
+        .into_iter()
+        .map(|bar| TossChartBar {
+            period_start_ms: bar.period_start_ms,
+            period_end_ms: bar.period_end_ms,
+            open_minor: bar.open_minor,
+            high_minor: bar.high_minor,
+            low_minor: bar.low_minor,
+            close_minor: bar.close_minor,
+            volume: bar.volume,
+            completed: bar.completed,
+            available_at_ms: Some(bar.period_end_ms),
+            ingested_at_ms: Some(snapshot.fetched_at_ms),
+            session_id: Some("UPBIT-24H".to_owned()),
+            contract_code: None,
+            settlement_price_minor: None,
+            mark_price_minor: None,
+            index_price_minor: None,
+            funding_rate_bps: None,
+            funding_time_ms: None,
+        })
+        .collect();
+    public_market_analysis_snapshot(
+        "UPBIT_PUBLIC_API",
+        market.clone(),
+        market.clone(),
+        "crypto_spot".to_owned(),
+        "crypto_spot",
+        "KRW".to_owned(),
+        "1d".to_owned(),
+        snapshot.fetched_at_ms,
+        bars,
+        vec!["24시간 연속시장 공개 일봉이며 거래가 없던 봉을 임의 생성하지 않습니다.".to_owned()],
+    )
+}
+
+#[tauri::command]
+pub async fn upbit_analysis_snapshot(
+    request: AnalysisSnapshotRequest,
+    bridge: State<'_, CryptoMarketBridge>,
+) -> Result<AnalysisSnapshot, String> {
+    fetch_upbit_analysis_snapshot(request, &bridge).await
+}
+
 #[tauri::command]
 pub async fn upbit_run_research_backtest(
     request: CryptoBacktestRequest,
     bridge: State<'_, CryptoMarketBridge>,
     persistence: State<'_, PersistenceBridge>,
 ) -> Result<CryptoBacktestRun, String> {
-    if request.interval != "1d" {
-        return Err("코인 전략 검증은 현재 완료된 업비트 일봉만 지원합니다.".to_owned());
-    }
+    validate_research_interval(&request.interval)?;
     if request.adjusted {
         return Err("업비트 코인 캔들에는 수정주가 옵션을 사용할 수 없습니다.".to_owned());
     }
@@ -609,11 +717,19 @@ pub async fn upbit_run_research_backtest(
         .collect::<Vec<_>>();
     let result = run_backtest(spec, &bars, &request.config)
         .map_err(|error| format!("코인 백테스트를 실행하지 못했습니다: {}", error.message))?;
-    let warnings = vec![
-        "업비트 공개 API의 최대 200개 완료 일봉을 사용하는 탐색 백테스트이며 성과 합격 판정은 하지 않습니다.".to_owned(),
-        "암호화폐 시장은 24시간 운영되며 일봉 경계는 업비트 KST 기준입니다.".to_owned(),
+    let mut warnings = vec![
+        format!("업비트 공개 API의 최대 200개 완료 {}을 사용하는 탐색 백테스트이며 성과 합격 판정은 하지 않습니다.", if request.interval == "1m" { "1분봉" } else { "일봉" }),
         "현재 백테스트 주문 수량은 내부 원장과 동일한 정수 코인 단위입니다. 소수 수량은 원장 고정소수점 마이그레이션 전까지 지원하지 않습니다.".to_owned(),
     ];
+    if request.interval == "1m" {
+        warnings.push(
+            "1분봉 200개는 약 3시간 20분의 짧은 구간이므로 강건성·승격 근거로 사용할 수 없습니다."
+                .to_owned(),
+        );
+    } else {
+        warnings
+            .push("암호화폐 시장은 24시간 운영되며 일봉 경계는 업비트 KST 기준입니다.".to_owned());
+    }
     let run = CryptoBacktestRun {
         review,
         result,
@@ -697,6 +813,20 @@ pub async fn upbit_execute_paper_market_order(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn analysis_market_resolver_accepts_explicit_code_and_supported_korean_aliases() {
+        assert_eq!(
+            resolve_analysis_market("KRW-BTC 1년 차트 분석").unwrap(),
+            "KRW-BTC"
+        );
+        assert_eq!(
+            resolve_analysis_market("비트코인 추세 분석").unwrap(),
+            "KRW-BTC"
+        );
+        assert_eq!(resolve_analysis_market("이더리움 분석").unwrap(), "KRW-ETH");
+        assert!(resolve_analysis_market("알 수 없는 코인").is_err());
+    }
     use crate::backtest::{run_backtest_with_risk, BacktestRiskLimits};
     use crate::research::{
         CrossDirection, EvidenceKind, ReferenceEvidence, SignalSpec, StrategySpec,
@@ -708,6 +838,14 @@ mod tests {
         assert_eq!(validate_market("krw-btc").unwrap(), "KRW-BTC");
         assert!(validate_market("BTC-USD").is_err());
         assert!(validate_market("KRW-비트코인").is_err());
+    }
+
+    #[test]
+    fn research_backtest_accepts_only_supported_completed_bar_intervals() {
+        assert!(validate_research_interval("1m").is_ok());
+        assert!(validate_research_interval("1d").is_ok());
+        assert!(validate_research_interval("5m").is_err());
+        assert!(validate_research_interval("tick").is_err());
     }
 
     #[test]
@@ -742,6 +880,21 @@ mod tests {
         assert!(bearer.starts_with("Bearer "));
         assert_eq!(bearer.trim_start_matches("Bearer ").split('.').count(), 3);
         assert!(!bearer.contains(&credentials.secret_key));
+    }
+
+    #[test]
+    #[ignore = "저장된 Upbit 자격정보와 외부 개인계좌 서버를 사용하는 명시적 읽기 전용 검사"]
+    fn live_upbit_account_snapshot_uses_stored_read_only_credentials() {
+        let credentials = load_upbit_credentials()
+            .expect("credential store")
+            .expect("stored Upbit credentials");
+        let accounts = tauri::async_runtime::block_on(fetch_upbit_accounts(
+            &CryptoMarketBridge::default(),
+            &credentials,
+        ))
+        .expect("Upbit read-only account snapshot");
+        assert!(accounts.len() <= 500);
+        eprintln!("UPBIT_ACCOUNT_CONNECTED=true read_only=true");
     }
 
     #[test]
@@ -896,5 +1049,24 @@ mod tests {
             risk_result.total_return_bps,
             risk_result.max_drawdown_bps
         );
+    }
+
+    #[test]
+    #[ignore = "업비트 공개 캔들 API와 외부 네트워크를 사용하는 명시적 분석 스냅샷 검사"]
+    fn live_upbit_analysis_snapshot_preserves_pit_metadata() {
+        let snapshot = tauri::async_runtime::block_on(fetch_upbit_analysis_snapshot(
+            AnalysisSnapshotRequest {
+                query: "KRW-BTC 분석".to_owned(),
+                count: 60,
+            },
+            &CryptoMarketBridge::default(),
+        ))
+        .expect("public spot snapshot");
+        assert_eq!(snapshot.asset_class, "crypto_spot");
+        assert!(snapshot.completed_bar_count >= 20);
+        assert!(snapshot
+            .bars
+            .iter()
+            .all(|bar| bar.available_at_ms.is_some() && bar.ingested_at_ms.is_some()));
     }
 }

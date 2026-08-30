@@ -6,7 +6,12 @@ use serde_json::{json, Value};
 use std::time::Duration;
 use tauri::State;
 
-use crate::persistence::PersistenceBridge;
+use crate::{
+    market_data::{
+        public_market_analysis_snapshot, AnalysisSnapshot, AnalysisSnapshotRequest, TossChartBar,
+    },
+    persistence::PersistenceBridge,
+};
 
 const CREDENTIAL_SERVICE: &str = "com.bumniverse.investa.kis-paper";
 const CONFIG_ACCOUNT: &str = "paper-config-v1";
@@ -37,6 +42,16 @@ pub struct KisPaperConfigStatus {
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
     access_token: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KisFuturesConnectionStatus {
+    configured: bool,
+    connected: bool,
+    provider: &'static str,
+    market_data_ready: bool,
+    message: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -215,6 +230,260 @@ async fn issue_paper_token(
         return Err("KIS 모의 인증 응답에 접근 토큰이 없습니다.".to_owned());
     }
     Ok(token)
+}
+
+fn resolve_kis_futures_contract(query: &str) -> Result<String, String> {
+    let normalized = query.trim().to_ascii_uppercase();
+    if normalized.is_empty()
+        || normalized.chars().count() > 500
+        || normalized.chars().any(char::is_control)
+    {
+        return Err("KIS 증권선물 분석 요청은 한 줄 1자 이상 500자 이하여야 합니다.".to_owned());
+    }
+    normalized
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .find(|token| {
+            (6..=12).contains(&token.len())
+                && token.bytes().any(|byte| byte.is_ascii_alphabetic())
+                && token.bytes().any(|byte| byte.is_ascii_digit())
+                && !token.ends_with("USDT")
+        })
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            "현재 만기의 KIS 선물 계약코드가 필요합니다. 예: 101W09. 지수명만으로 근월물을 추정하지 않습니다."
+                .to_owned()
+        })
+}
+
+fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
+    let adjusted = days_since_epoch + 719_468;
+    let era = if adjusted >= 0 {
+        adjusted
+    } else {
+        adjusted - 146_096
+    } / 146_097;
+    let day_of_era = adjusted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year as i32, month as u32, day as u32)
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> Option<i64> {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let adjusted_year = i64::from(year) - i64::from(month <= 2);
+    let era = if adjusted_year >= 0 {
+        adjusted_year
+    } else {
+        adjusted_year - 399
+    } / 400;
+    let year_of_era = adjusted_year - era * 400;
+    let month_prime = i64::from(month) + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month_prime + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    Some(era * 146_097 + day_of_era - 719_468)
+}
+
+fn format_yyyymmdd(days_since_epoch: i64) -> String {
+    let (year, month, day) = civil_from_days(days_since_epoch);
+    format!("{year:04}{month:02}{day:02}")
+}
+
+fn parse_kis_business_date(value: &str) -> Option<u64> {
+    if value.len() != 8 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let year = value[0..4].parse::<i32>().ok()?;
+    let month = value[4..6].parse::<u32>().ok()?;
+    let day = value[6..8].parse::<u32>().ok()?;
+    let days = days_from_civil(year, month, day)?;
+    if civil_from_days(days) != (year, month, day) {
+        return None;
+    }
+    // KRX 일봉 시작은 한국 표준시 자정이며 다음 한국 표준시 자정에 공개 가능한 것으로 둔다.
+    u64::try_from(days.checked_mul(86_400_000)?.checked_sub(9 * 3_600_000)?).ok()
+}
+
+fn parse_futures_point_minor(value: &str) -> Option<u64> {
+    let parsed = value.trim().parse::<f64>().ok()?;
+    let scaled = parsed * 100.0;
+    if !scaled.is_finite() || scaled <= 0.0 || scaled > u64::MAX as f64 {
+        return None;
+    }
+    Some(scaled.round() as u64)
+}
+
+fn parse_futures_volume(value: &str) -> Option<u64> {
+    let parsed = value.trim().parse::<f64>().ok()?;
+    if !parsed.is_finite() || parsed < 0.0 || parsed > u64::MAX as f64 {
+        return None;
+    }
+    Some(parsed.round() as u64)
+}
+
+fn parse_kis_futures_bars(
+    rows: &[Value],
+    contract_code: &str,
+    fetched_at_ms: u64,
+) -> Result<Vec<TossChartBar>, String> {
+    let mut bars = Vec::with_capacity(rows.len());
+    for row in rows {
+        let session_id = string_field(row, "stck_bsop_date");
+        let period_start_ms = parse_kis_business_date(&session_id)
+            .ok_or_else(|| "KIS 선물 일봉의 영업일자를 해석하지 못했습니다.".to_owned())?;
+        let period_end_ms = period_start_ms
+            .checked_add(86_400_000)
+            .ok_or_else(|| "KIS 선물 일봉 종료 시각이 지원 범위를 초과했습니다.".to_owned())?;
+        let open_minor = parse_futures_point_minor(&string_field(row, "futs_oprc"))
+            .ok_or_else(|| "KIS 선물 일봉 시가를 해석하지 못했습니다.".to_owned())?;
+        let high_minor = parse_futures_point_minor(&string_field(row, "futs_hgpr"))
+            .ok_or_else(|| "KIS 선물 일봉 고가를 해석하지 못했습니다.".to_owned())?;
+        let low_minor = parse_futures_point_minor(&string_field(row, "futs_lwpr"))
+            .ok_or_else(|| "KIS 선물 일봉 저가를 해석하지 못했습니다.".to_owned())?;
+        let close_minor = parse_futures_point_minor(&string_field(row, "futs_prpr"))
+            .ok_or_else(|| "KIS 선물 일봉 종가를 해석하지 못했습니다.".to_owned())?;
+        if low_minor > open_minor
+            || low_minor > close_minor
+            || high_minor < open_minor
+            || high_minor < close_minor
+        {
+            return Err("KIS 선물 일봉 OHLC 관계가 올바르지 않습니다.".to_owned());
+        }
+        bars.push(TossChartBar {
+            period_start_ms,
+            period_end_ms,
+            open_minor,
+            high_minor,
+            low_minor,
+            close_minor,
+            volume: parse_futures_volume(&string_field(row, "acml_vol"))
+                .ok_or_else(|| "KIS 선물 일봉 거래량을 해석하지 못했습니다.".to_owned())?,
+            completed: period_end_ms <= fetched_at_ms,
+            available_at_ms: Some(period_end_ms),
+            ingested_at_ms: Some(fetched_at_ms),
+            session_id: Some(session_id),
+            contract_code: Some(contract_code.to_owned()),
+            settlement_price_minor: None,
+            mark_price_minor: None,
+            index_price_minor: None,
+            funding_rate_bps: None,
+            funding_time_ms: None,
+        });
+    }
+    bars.sort_by_key(|bar| bar.period_start_ms);
+    if bars
+        .windows(2)
+        .any(|pair| pair[0].period_start_ms >= pair[1].period_start_ms)
+    {
+        return Err("KIS 선물 일봉에 중복 또는 역순 영업일자가 있습니다.".to_owned());
+    }
+    Ok(bars)
+}
+
+#[tauri::command]
+pub fn kis_futures_connection_status() -> Result<KisFuturesConnectionStatus, String> {
+    Ok(match load()? {
+        Some(_) => KisFuturesConnectionStatus {
+            configured: true,
+            connected: false,
+            provider: "KIS_VIRTUAL_MARKET_DATA",
+            market_data_ready: true,
+            message: "KIS 모의 App Key·Secret이 저장되어 있습니다. 현재 만기 계약코드로 읽기 전용 일봉을 조회할 수 있습니다.".to_owned(),
+        },
+        None => KisFuturesConnectionStatus {
+            configured: false,
+            connected: false,
+            provider: "KIS_VIRTUAL_MARKET_DATA",
+            market_data_ready: false,
+            message: "KIS 모의 App Key·Secret을 연결하면 국내 지수선물 일봉을 읽기 전용으로 조회합니다.".to_owned(),
+        },
+    })
+}
+
+#[tauri::command]
+pub async fn kis_futures_analysis_snapshot(
+    request: AnalysisSnapshotRequest,
+) -> Result<AnalysisSnapshot, String> {
+    let contract_code = resolve_kis_futures_contract(&request.query)?;
+    let config = load()?.ok_or_else(|| "KIS 모의 자격정보를 먼저 연결해 주세요.".to_owned())?;
+    let client = Client::new();
+    let token = issue_paper_token(&client, &config).await?;
+    let fetched_at_ms = crate::persistence::now_ms()?;
+    let today = i64::try_from(fetched_at_ms / 86_400_000)
+        .map_err(|_| "현재 날짜가 지원 범위를 초과했습니다.".to_owned())?;
+    let start_date = format_yyyymmdd(today - 370);
+    let end_date = format_yyyymmdd(today);
+    let response = client
+        .get(format!("{PAPER_API_BASE}/uapi/domestic-futureoption/v1/quotations/inquire-daily-fuopchartprice"))
+        .timeout(Duration::from_secs(10))
+        .bearer_auth(token)
+        .header("appkey", &config.app_key)
+        .header("appsecret", &config.app_secret)
+        .header("tr_id", "FHKIF03020100")
+        .header("custtype", "P")
+        .query(&[
+            ("FID_COND_MRKT_DIV_CODE", "F"),
+            ("FID_INPUT_ISCD", contract_code.as_str()),
+            ("FID_INPUT_DATE_1", start_date.as_str()),
+            ("FID_INPUT_DATE_2", end_date.as_str()),
+            ("FID_PERIOD_DIV_CODE", "D"),
+        ])
+        .send()
+        .await
+        .map_err(|_| "KIS 국내선물 일봉 서버에 연결하지 못했습니다.".to_owned())?;
+    if !response.status().is_success() {
+        return Err(
+            "KIS 국내선물 일봉 조회가 실패했습니다. API 신청 범위와 계약코드를 확인해 주세요."
+                .to_owned(),
+        );
+    }
+    let body = response
+        .json::<Value>()
+        .await
+        .map_err(|_| "KIS 국내선물 일봉 응답을 해석하지 못했습니다.".to_owned())?;
+    if body.get("rt_cd").and_then(Value::as_str) != Some("0") {
+        return Err(body
+            .get("msg1")
+            .and_then(Value::as_str)
+            .unwrap_or("KIS 국내선물 일봉 조회가 거절됐습니다.")
+            .to_owned());
+    }
+    let name = body
+        .get("output1")
+        .map(|row| string_field(row, "hts_kor_isnm"))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| contract_code.clone());
+    let rows = body
+        .get("output2")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "KIS 국내선물 일봉 응답에 차트 배열이 없습니다.".to_owned())?;
+    let mut bars = parse_kis_futures_bars(rows, &contract_code, fetched_at_ms)?;
+    let requested_count = usize::from(request.count.clamp(20, 100));
+    if bars.len() > requested_count {
+        bars = bars.split_off(bars.len() - requested_count);
+    }
+    public_market_analysis_snapshot(
+        "KIS_VIRTUAL_MARKET_DATA",
+        contract_code,
+        name,
+        "securities_futures".to_owned(),
+        "securities_future",
+        "POINT".to_owned(),
+        "1d".to_owned(),
+        fetched_at_ms,
+        bars,
+        vec![
+            "KIS 공식 기간별시세 응답에 별도 일별 정산가 필드가 없어 종가를 정산가로 대체하지 않습니다.".to_owned(),
+            "근월물 자동 선택과 연속선물 보정은 적용하지 않으며 사용자가 지정한 단일 계약만 조회합니다.".to_owned(),
+        ],
+    )
 }
 
 fn valid_request_id(value: &str) -> bool {
@@ -715,6 +984,43 @@ mod tests {
             ..valid
         };
         assert!(validate(&invalid).is_err());
+    }
+
+    #[test]
+    fn resolves_explicit_kis_futures_contract_without_guessing_nearby_month() {
+        assert_eq!(
+            resolve_kis_futures_contract("KIS 지수선물 101W09 일봉").expect("contract"),
+            "101W09"
+        );
+        assert!(resolve_kis_futures_contract("코스피200 근월물 분석").is_err());
+        assert!(resolve_kis_futures_contract("BTCUSDT 코인 선물").is_err());
+    }
+
+    #[test]
+    fn parses_kis_futures_daily_bars_with_contract_and_pit_boundary() {
+        let rows = vec![json!({
+            "stck_bsop_date": "20260825",
+            "futs_oprc": "355.10",
+            "futs_hgpr": "358.25",
+            "futs_lwpr": "352.80",
+            "futs_prpr": "357.40",
+            "acml_vol": "123456"
+        })];
+        let fetched_at_ms = parse_kis_business_date("20260827").expect("date");
+        let bars = parse_kis_futures_bars(&rows, "101W09", fetched_at_ms).expect("bars");
+        assert_eq!(bars.len(), 1);
+        assert_eq!(bars[0].contract_code.as_deref(), Some("101W09"));
+        assert_eq!(bars[0].session_id.as_deref(), Some("20260825"));
+        assert_eq!(bars[0].close_minor, 35_740);
+        assert!(bars[0].settlement_price_minor.is_none());
+        assert!(bars[0].completed);
+    }
+
+    #[test]
+    fn rejects_invalid_kis_business_dates_and_oversized_points() {
+        assert!(parse_kis_business_date("20260231").is_none());
+        assert!(parse_kis_business_date("20261301").is_none());
+        assert!(parse_futures_point_minor("1e30").is_none());
     }
 
     #[test]

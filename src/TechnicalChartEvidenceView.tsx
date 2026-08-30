@@ -1,6 +1,8 @@
-import type { TechnicalChartEvidence } from "./technicalChartEvidence";
+import { inferTechnicalChartAssetClass, type TechnicalChartEvidence } from "./technicalChartEvidence";
 
-const formatMoney = (minor: number, currency: string) => new Intl.NumberFormat("ko-KR", {
+const formatMoney = (minor: number, currency: string) => currency === "POINT"
+  ? `${new Intl.NumberFormat("ko-KR", { maximumFractionDigits: 2 }).format(minor / 100)} pt`
+  : new Intl.NumberFormat("ko-KR", {
   style: "currency",
   currency,
   maximumFractionDigits: currency === "KRW" ? 0 : 2,
@@ -45,8 +47,10 @@ export function TechnicalChartEvidenceView({ evidence }: { evidence: TechnicalCh
       })}
       {evidence.annotations.map((annotation) => annotation.kind === "rectangle"
         ? <g key={annotation.id}><rect x={Math.min(x(annotation.startTime), x(annotation.endTime))} y={y(annotation.endPriceMinor)} width={Math.max(2, Math.abs(x(annotation.endTime) - x(annotation.startTime)))} height={Math.max(2, Math.abs(y(annotation.startPriceMinor) - y(annotation.endPriceMinor)))} fill={`${annotation.color}18`} stroke={annotation.color} strokeDasharray="6 4" /><text x={Math.min(x(annotation.startTime), x(annotation.endTime)) + 6} y={y(annotation.endPriceMinor) + 16} fill={annotation.color}>{annotation.label}</text></g>
+        : annotation.kind === "vertical_line"
+          ? <g key={annotation.id}><line x1={x(annotation.startTime)} x2={x(annotation.startTime)} y1={plot.top} y2={plot.top + plotHeight} stroke={annotation.color} strokeWidth="1.8" strokeDasharray="4 4" vectorEffect="non-scaling-stroke" /><text x={x(annotation.startTime) + 5} y={plot.top + 14} fill={annotation.color}>{annotation.label}</text></g>
         : <g key={annotation.id}><line x1={x(annotation.startTime)} x2={x(annotation.endTime)} y1={y(annotation.startPriceMinor)} y2={y(annotation.endPriceMinor)} stroke={annotation.color} strokeWidth="2.2" strokeDasharray={annotation.kind === "horizontal_line" ? "7 4" : undefined} vectorEffect="non-scaling-stroke" /><rect x={Math.max(plot.left, x(annotation.endTime) - 132)} y={Math.max(plot.top, y(annotation.endPriceMinor) - 20)} width="128" height="17" fill="#09100cdd" /><text x={x(annotation.endTime) - 8} y={Math.max(plot.top + 12, y(annotation.endPriceMinor) - 8)} fill={annotation.color} textAnchor="end">{annotation.label}</text></g>)}
-      <text x={plot.left} y={height - 14}>{evidence.adjusted ? "수정주가" : "원주가"} · {bars.length}개 완료 봉 · snapshot {evidence.sourceSnapshotId}</text>
+      <text x={plot.left} y={height - 14}>{evidence.assetClass ?? inferTechnicalChartAssetClass(evidence.market)} · {evidence.adjusted ? "수정/보정" : "원자료"} · {bars.length}개 완료 봉 · snapshot {evidence.sourceSnapshotId}</text>
     </svg>
     <div className="technical-chart-method"><strong>선 산출 기준</strong><p>{evidence.method}</p><ul>{evidence.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul></div>
   </figure>;

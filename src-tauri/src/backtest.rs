@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     pattern_probability::{analyze_pattern_probabilities, PatternProbabilityReport},
-    research::{review_strategy_spec, CrossDirection, SignalSpec, StrategySpec},
+    research::{review_strategy_spec, SignalSpec, StrategySpec},
     simulation::{quote_execution_scaled, CostError, TradingCosts},
     trading::TradeSide,
 };
@@ -232,43 +232,9 @@ fn map_cost_error(cost_error: CostError) -> BacktestError {
     )
 }
 
-fn signal_parts(signal: &SignalSpec) -> (usize, usize, CrossDirection) {
-    match signal {
-        SignalSpec::MovingAverageCross {
-            fast_window,
-            slow_window,
-            direction,
-        } => (*fast_window, *slow_window, *direction),
-    }
-}
-
-fn mean(values: &[PriceBar]) -> Result<u128, BacktestError> {
-    let total = values.iter().try_fold(0_u128, |sum, bar| {
-        sum.checked_add(u128::from(bar.close_minor)).ok_or_else(|| {
-            error(
-                BacktestErrorCode::ArithmeticOverflow,
-                "이동평균 합계가 범위를 초과했습니다.",
-            )
-        })
-    })?;
-    Ok(total / values.len() as u128)
-}
-
 fn crossed(bars: &[PriceBar], index: usize, signal: &SignalSpec) -> Result<bool, BacktestError> {
-    let (fast, slow, direction) = signal_parts(signal);
-    if index < slow {
-        return Ok(false);
-    }
-
-    let previous_fast = mean(&bars[index - fast..index])?;
-    let previous_slow = mean(&bars[index - slow..index])?;
-    let current_fast = mean(&bars[index + 1 - fast..=index])?;
-    let current_slow = mean(&bars[index + 1 - slow..=index])?;
-
-    Ok(match direction {
-        CrossDirection::Above => previous_fast <= previous_slow && current_fast > current_slow,
-        CrossDirection::Below => previous_fast >= previous_slow && current_fast < current_slow,
-    })
+    crate::strategy_plugins::signal_matches(bars, index, signal)
+        .map_err(|message| error(BacktestErrorCode::ArithmeticOverflow, &message))
 }
 
 /// 저장된 시점 정합 가격봉의 마지막 완료 봉에서만 신호를 평가한다.
@@ -450,8 +416,9 @@ fn validate_inputs(
     }
     crate::simulation::validate_costs(config.costs).map_err(map_cost_error)?;
 
-    let (_, slow_window, _) = signal_parts(&spec.entry_signal);
-    if bars.len() <= slow_window + 1 || bars.len() > 5_000_000 {
+    let required_history = crate::strategy_plugins::minimum_history(&spec.entry_signal)
+        .max(crate::strategy_plugins::minimum_history(&spec.exit_signal));
+    if bars.len() <= required_history || bars.len() > 5_000_000 {
         return Err(error(
             BacktestErrorCode::InsufficientData,
             "신호와 다음 시점 체결을 계산할 가격 봉이 부족합니다.",
@@ -504,6 +471,8 @@ fn validate_inputs(
         previous_start = Some(bar.period_start_ms);
         previous_end = Some(bar.period_end_ms);
     }
+    crate::strategy_plugins::validate_runtime_contract(spec, bars)
+        .map_err(|message| error(BacktestErrorCode::InvalidStrategy, &message))?;
     Ok(())
 }
 
@@ -1091,7 +1060,7 @@ pub fn run_backtest_with_risk(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::research::{Market, StrategySpec};
+    use crate::research::{CrossDirection, Market, StrategySpec};
 
     fn strategy() -> StrategySpec {
         StrategySpec {
@@ -1312,5 +1281,59 @@ mod tests {
                 .code,
             BacktestErrorCode::InvalidBar
         );
+    }
+
+    #[test]
+    fn all_versioned_strategy_plugins_use_the_same_point_in_time_backtest_path() {
+        let plugin_signals = [
+            (
+                SignalSpec::PriceChannelBreakout {
+                    lookback: 3,
+                    direction: CrossDirection::Above,
+                },
+                SignalSpec::PriceChannelBreakout {
+                    lookback: 3,
+                    direction: CrossDirection::Below,
+                },
+            ),
+            (
+                SignalSpec::MeanReversion {
+                    window: 3,
+                    deviation_bps: 500,
+                    direction: CrossDirection::Below,
+                },
+                SignalSpec::MeanReversion {
+                    window: 3,
+                    deviation_bps: 500,
+                    direction: CrossDirection::Above,
+                },
+            ),
+            (
+                SignalSpec::VolatilityExpansion {
+                    atr_window: 3,
+                    breakout_window: 3,
+                    minimum_expansion_bps: 1,
+                    direction: CrossDirection::Above,
+                },
+                SignalSpec::VolatilityExpansion {
+                    atr_window: 3,
+                    breakout_window: 3,
+                    minimum_expansion_bps: 1,
+                    direction: CrossDirection::Below,
+                },
+            ),
+        ];
+        for (entry, exit) in plugin_signals {
+            let mut plugin_strategy = strategy();
+            plugin_strategy.entry_signal = entry;
+            plugin_strategy.exit_signal = exit;
+            let result = run_backtest(&plugin_strategy, &bars(), &config(zero_costs()))
+                .expect("versioned plugin backtest");
+            assert_eq!(result.strategy_id, plugin_strategy.strategy_id);
+            assert!(matches!(
+                result.validation.look_ahead.status,
+                ValidationStatus::Passed
+            ));
+        }
     }
 }

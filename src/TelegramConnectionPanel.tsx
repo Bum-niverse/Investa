@@ -1,7 +1,7 @@
-import { type FormEvent, useEffect, useState } from "react";
+import { type FormEvent, useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
-type TelegramConnectionStatus = {
+export type TelegramConnectionStatus = {
   configured: boolean;
   sessionStored: boolean;
   authorized: boolean;
@@ -40,6 +40,7 @@ type TelegramSyncResult = {
 
 type TelegramConnectionPanelProps = {
   open: boolean;
+  onStatusChange?: (status: TelegramConnectionStatus) => void;
 };
 
 const EMPTY_STATUS: TelegramConnectionStatus = {
@@ -50,7 +51,7 @@ const EMPTY_STATUS: TelegramConnectionStatus = {
   message: "연결 상태를 확인하고 있습니다.",
 };
 
-export function TelegramConnectionPanel({ open }: TelegramConnectionPanelProps) {
+export function TelegramConnectionPanel({ open, onStatusChange }: TelegramConnectionPanelProps) {
   const [status, setStatus] = useState<TelegramConnectionStatus>(EMPTY_STATUS);
   const [apiId, setApiId] = useState("");
   const [apiHash, setApiHash] = useState("");
@@ -62,6 +63,11 @@ export function TelegramConnectionPanel({ open }: TelegramConnectionPanelProps) 
   const [syncResult, setSyncResult] = useState<TelegramSyncResult | null>(null);
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  const applyStatus = useCallback((nextStatus: TelegramConnectionStatus) => {
+    setStatus(nextStatus);
+    onStatusChange?.(nextStatus);
+  }, [onStatusChange]);
 
   useEffect(() => {
     if (!open) {
@@ -78,10 +84,10 @@ export function TelegramConnectionPanel({ open }: TelegramConnectionPanelProps) 
     }
     let disposed = false;
     void invoke<TelegramConnectionStatus>("telegram_connection_status")
-      .then((nextStatus) => { if (!disposed) setStatus(nextStatus); })
+      .then((nextStatus) => { if (!disposed) applyStatus(nextStatus); })
       .catch((reason) => { if (!disposed) setError(String(reason)); });
     return () => { disposed = true; };
-  }, [open]);
+  }, [applyStatus, open]);
 
   const run = async (action: string, operation: () => Promise<void>) => {
     if (busyAction) return;
@@ -102,7 +108,7 @@ export function TelegramConnectionPanel({ open }: TelegramConnectionPanelProps) 
       const nextStatus = await invoke<TelegramConnectionStatus>("telegram_save_credentials", {
         request: { apiId, apiHash },
       });
-      setStatus(nextStatus);
+      applyStatus(nextStatus);
       setApiId("");
       setApiHash("");
     });
@@ -115,7 +121,7 @@ export function TelegramConnectionPanel({ open }: TelegramConnectionPanelProps) 
       setLoginState(nextState);
       setPhone("");
       if (nextState.stage === "authorized") {
-        setStatus(await invoke<TelegramConnectionStatus>("telegram_connection_status"));
+        applyStatus(await invoke<TelegramConnectionStatus>("telegram_connection_status"));
       }
     });
   };
@@ -127,7 +133,7 @@ export function TelegramConnectionPanel({ open }: TelegramConnectionPanelProps) 
       setLoginState(nextState);
       setCode("");
       if (nextState.stage === "authorized") {
-        setStatus(await invoke<TelegramConnectionStatus>("telegram_connection_status"));
+        applyStatus(await invoke<TelegramConnectionStatus>("telegram_connection_status"));
       }
     });
   };
@@ -138,7 +144,7 @@ export function TelegramConnectionPanel({ open }: TelegramConnectionPanelProps) 
       const nextState = await invoke<TelegramLoginState>("telegram_login_password", { request: { password } });
       setLoginState(nextState);
       setPassword("");
-      setStatus(await invoke<TelegramConnectionStatus>("telegram_connection_status"));
+      applyStatus(await invoke<TelegramConnectionStatus>("telegram_connection_status"));
     });
   };
 
@@ -154,7 +160,7 @@ export function TelegramConnectionPanel({ open }: TelegramConnectionPanelProps) 
         request: { peerIds: channels.filter((channel) => channel.selected).map((channel) => channel.peerId) },
       });
       setChannels(nextChannels);
-      setStatus(await invoke<TelegramConnectionStatus>("telegram_connection_status"));
+      applyStatus(await invoke<TelegramConnectionStatus>("telegram_connection_status"));
     });
   };
 
@@ -168,7 +174,7 @@ export function TelegramConnectionPanel({ open }: TelegramConnectionPanelProps) 
   const deleteConnection = () => {
     if (!window.confirm("이 PC의 Telegram API 자격정보와 로그인 세션을 삭제할까요? 저장된 뉴스 리비전은 분석 재현을 위해 유지됩니다.")) return;
     void run("delete", async () => {
-      setStatus(await invoke<TelegramConnectionStatus>("telegram_delete_connection"));
+      applyStatus(await invoke<TelegramConnectionStatus>("telegram_delete_connection"));
       setChannels([]);
       setSyncResult(null);
       setLoginState(null);

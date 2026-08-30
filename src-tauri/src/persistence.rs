@@ -16,7 +16,7 @@ use crate::{
     research::{ResearchReport, StrategyReview},
 };
 
-pub(crate) const SCHEMA_VERSION: u32 = 21;
+pub(crate) const SCHEMA_VERSION: u32 = 29;
 const MAX_HISTORY_LIMIT: u16 = 100;
 
 pub struct PersistenceBridge {
@@ -411,6 +411,26 @@ fn initialize(connection: &Connection) -> Result<(), String> {
              ) STRICT;
              CREATE INDEX IF NOT EXISTS manual_paper_orders_updated_at
                  ON manual_paper_orders(updated_at_ms DESC, order_id DESC);
+             CREATE TABLE IF NOT EXISTS internal_execution_plans (
+                 execution_id TEXT PRIMARY KEY NOT NULL CHECK(length(execution_id) BETWEEN 1 AND 128),
+                 idempotency_key TEXT UNIQUE NOT NULL CHECK(length(idempotency_key) BETWEEN 1 AND 128),
+                 status TEXT NOT NULL CHECK(status IN ('working','partially_filled','filled','cancelled','expired')),
+                 request_json TEXT NOT NULL CHECK(length(request_json) BETWEEN 2 AND 100000),
+                 state_json TEXT NOT NULL CHECK(length(state_json) BETWEEN 2 AND 500000),
+                 created_at_ms INTEGER NOT NULL CHECK(created_at_ms > 0),
+                 updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= created_at_ms)
+             ) STRICT;
+             CREATE INDEX IF NOT EXISTS internal_execution_plans_updated
+                 ON internal_execution_plans(updated_at_ms DESC,execution_id DESC);
+             CREATE TABLE IF NOT EXISTS internal_execution_events (
+                 event_id TEXT PRIMARY KEY NOT NULL CHECK(length(event_id) BETWEEN 1 AND 128),
+                 execution_id TEXT NOT NULL REFERENCES internal_execution_plans(execution_id),
+                 event_index INTEGER NOT NULL CHECK(event_index >= 0),
+                 event_type TEXT NOT NULL CHECK(event_type IN ('fill','reprice','cancel','expire')),
+                 event_json TEXT NOT NULL CHECK(length(event_json) BETWEEN 2 AND 100000),
+                 occurred_at_ms INTEGER NOT NULL CHECK(occurred_at_ms > 0),
+                 UNIQUE(execution_id,event_index)
+             ) STRICT;
              CREATE TABLE IF NOT EXISTS shadow_watches (
                  watch_id TEXT PRIMARY KEY NOT NULL,
                  experiment_id TEXT NOT NULL REFERENCES backtest_runs(experiment_id),
@@ -422,6 +442,39 @@ fn initialize(connection: &Connection) -> Result<(), String> {
                  last_error TEXT,
                  created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
                  updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= created_at_ms)
+             ) STRICT;
+             CREATE TABLE IF NOT EXISTS strategy_deployments (
+                 deployment_id TEXT PRIMARY KEY NOT NULL CHECK(length(deployment_id) BETWEEN 1 AND 128),
+                 idempotency_key TEXT UNIQUE NOT NULL CHECK(length(idempotency_key) BETWEEN 1 AND 128),
+                 slot_key TEXT NOT NULL CHECK(length(slot_key) BETWEEN 1 AND 256),
+                 experiment_id TEXT NOT NULL REFERENCES backtest_runs(experiment_id),
+                 validation_run_id TEXT NOT NULL REFERENCES walk_forward_runs(validation_run_id),
+                 strategy_id TEXT NOT NULL CHECK(length(strategy_id) BETWEEN 1 AND 128),
+                 strategy_schema_version TEXT NOT NULL CHECK(length(strategy_schema_version) BETWEEN 1 AND 32),
+                 plugin_id TEXT NOT NULL CHECK(length(plugin_id) BETWEEN 1 AND 128),
+                 plugin_version INTEGER NOT NULL CHECK(plugin_version > 0),
+                 dataset_id TEXT NOT NULL REFERENCES datasets(dataset_id),
+                 evidence_sha256 TEXT NOT NULL CHECK(length(evidence_sha256) = 64),
+                 status TEXT NOT NULL CHECK(status IN ('awaiting_approval','canary','canary_passed','paper_active','stopped','superseded','rolled_back','rejected')),
+                 revision INTEGER NOT NULL CHECK(revision > 0),
+                 canary_policy_json TEXT NOT NULL CHECK(length(canary_policy_json) BETWEEN 2 AND 100000),
+                 evidence_json TEXT NOT NULL CHECK(length(evidence_json) BETWEEN 2 AND 1000000),
+                 previous_deployment_id TEXT REFERENCES strategy_deployments(deployment_id),
+                 created_at_ms INTEGER NOT NULL CHECK(created_at_ms > 0),
+                 updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= created_at_ms)
+             ) STRICT;
+             CREATE UNIQUE INDEX IF NOT EXISTS strategy_deployments_active_slot
+                 ON strategy_deployments(slot_key) WHERE status = 'paper_active';
+             CREATE INDEX IF NOT EXISTS strategy_deployments_slot_time
+                 ON strategy_deployments(slot_key,updated_at_ms DESC,deployment_id DESC);
+             CREATE TABLE IF NOT EXISTS strategy_deployment_events (
+                 event_id TEXT PRIMARY KEY NOT NULL CHECK(length(event_id) BETWEEN 1 AND 128),
+                 deployment_id TEXT NOT NULL REFERENCES strategy_deployments(deployment_id),
+                 event_index INTEGER NOT NULL CHECK(event_index >= 0),
+                 event_type TEXT NOT NULL CHECK(event_type IN ('candidate_created','canary_approved','canary_observed','performance_observed','canary_passed','auto_stopped','paper_approved','superseded','rollback_approved','rejected')),
+                 event_json TEXT NOT NULL CHECK(length(event_json) BETWEEN 2 AND 200000),
+                 occurred_at_ms INTEGER NOT NULL CHECK(occurred_at_ms > 0),
+                 UNIQUE(deployment_id,event_index)
              ) STRICT;
              CREATE TABLE IF NOT EXISTS workflow_jobs (
                  job_id TEXT PRIMARY KEY NOT NULL,
@@ -715,6 +768,80 @@ fn initialize(connection: &Connection) -> Result<(), String> {
              ) STRICT;
              CREATE INDEX IF NOT EXISTS forecast_calibration_runs_trace
                  ON forecast_calibration_runs(asset_class, model_id, model_version, dataset_id, horizon_ms, created_at_ms DESC);
+             CREATE TABLE IF NOT EXISTS ml_dataset_manifests (
+                 manifest_id TEXT PRIMARY KEY NOT NULL CHECK(length(manifest_id) BETWEEN 1 AND 128),
+                 audit_id TEXT NOT NULL REFERENCES forecast_dataset_audits(audit_id),
+                 dataset_id TEXT NOT NULL CHECK(length(dataset_id) BETWEEN 1 AND 128),
+                 asset_class TEXT NOT NULL CHECK(asset_class IN ('korea_stock', 'united_states_stock', 'equity_future', 'index_future', 'crypto_spot', 'crypto_perpetual')),
+                 content_sha256 TEXT NOT NULL CHECK(length(content_sha256) = 64),
+                 feature_schema_sha256 TEXT NOT NULL CHECK(length(feature_schema_sha256) = 64),
+                 sample_count INTEGER NOT NULL CHECK(sample_count > 0),
+                 feature_count INTEGER NOT NULL CHECK(feature_count > 0),
+                 manifest_json TEXT NOT NULL CHECK(length(manifest_json) BETWEEN 2 AND 1000000),
+                 payload_json TEXT NOT NULL CHECK(length(payload_json) BETWEEN 2 AND 67108864),
+                 created_at_ms INTEGER NOT NULL CHECK(created_at_ms > 0)
+             ) STRICT;
+             CREATE INDEX IF NOT EXISTS ml_dataset_manifests_dataset_created
+                 ON ml_dataset_manifests(dataset_id, created_at_ms DESC);
+             CREATE TABLE IF NOT EXISTS ml_dataset_shard_sets (
+                 shard_set_id TEXT PRIMARY KEY NOT NULL CHECK(length(shard_set_id) BETWEEN 1 AND 128),
+                 dataset_id TEXT NOT NULL CHECK(length(dataset_id) BETWEEN 1 AND 128),
+                 asset_class TEXT NOT NULL CHECK(asset_class IN ('korea_stock', 'united_states_stock', 'equity_future', 'index_future', 'crypto_spot', 'crypto_perpetual')),
+                 feature_schema_sha256 TEXT NOT NULL CHECK(length(feature_schema_sha256) = 64),
+                 combined_content_sha256 TEXT NOT NULL CHECK(length(combined_content_sha256) = 64),
+                 shard_count INTEGER NOT NULL CHECK(shard_count BETWEEN 2 AND 64),
+                 sample_count INTEGER NOT NULL CHECK(sample_count > 0),
+                 feature_count INTEGER NOT NULL CHECK(feature_count > 0),
+                 record_json TEXT NOT NULL CHECK(length(record_json) BETWEEN 2 AND 1000000),
+                 created_at_ms INTEGER NOT NULL CHECK(created_at_ms > 0)
+             ) STRICT;
+             CREATE INDEX IF NOT EXISTS ml_dataset_shard_sets_created
+                 ON ml_dataset_shard_sets(created_at_ms DESC, shard_set_id);
+             CREATE TABLE IF NOT EXISTS ml_training_jobs (
+                 job_id TEXT PRIMARY KEY NOT NULL CHECK(length(job_id) BETWEEN 1 AND 128),
+                 manifest_id TEXT NOT NULL REFERENCES ml_dataset_manifests(manifest_id),
+                 algorithm TEXT NOT NULL CHECK(algorithm IN ('lightgbm', 'xgboost', 'chronos', 'timesfm')),
+                 contract_version TEXT NOT NULL CHECK(length(contract_version) BETWEEN 1 AND 64),
+                 input_sha256 TEXT NOT NULL CHECK(length(input_sha256) = 64),
+                 status TEXT NOT NULL CHECK(status IN ('prepared', 'completed', 'failed')),
+                 request_json TEXT NOT NULL CHECK(length(request_json) BETWEEN 2 AND 1000000),
+                 result_json TEXT,
+                 created_at_ms INTEGER NOT NULL CHECK(created_at_ms > 0),
+                 updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= created_at_ms)
+             ) STRICT;
+             CREATE INDEX IF NOT EXISTS ml_training_jobs_manifest_created
+                 ON ml_training_jobs(manifest_id, created_at_ms DESC);
+             CREATE TABLE IF NOT EXISTS ml_training_job_sources (
+                 job_id TEXT PRIMARY KEY NOT NULL REFERENCES ml_training_jobs(job_id),
+                 source_kind TEXT NOT NULL CHECK(source_kind IN ('manifest', 'shard_set')),
+                 source_id TEXT NOT NULL CHECK(length(source_id) BETWEEN 1 AND 128),
+                 source_content_sha256 TEXT NOT NULL CHECK(length(source_content_sha256) = 64),
+                 created_at_ms INTEGER NOT NULL CHECK(created_at_ms > 0)
+             ) STRICT;
+             CREATE INDEX IF NOT EXISTS ml_training_job_sources_source
+                 ON ml_training_job_sources(source_kind, source_id, created_at_ms DESC);
+             INSERT OR IGNORE INTO ml_training_job_sources
+                 (job_id, source_kind, source_id, source_content_sha256, created_at_ms)
+             SELECT jobs.job_id, 'manifest', jobs.manifest_id, manifests.content_sha256, jobs.created_at_ms
+             FROM ml_training_jobs AS jobs
+             INNER JOIN ml_dataset_manifests AS manifests
+                 ON manifests.manifest_id = jobs.manifest_id;
+             CREATE TABLE IF NOT EXISTS ml_model_versions (
+                 model_id TEXT NOT NULL CHECK(length(model_id) BETWEEN 1 AND 128),
+                 model_version TEXT NOT NULL CHECK(length(model_version) BETWEEN 1 AND 128),
+                 job_id TEXT NOT NULL UNIQUE REFERENCES ml_training_jobs(job_id),
+                 asset_class TEXT NOT NULL CHECK(asset_class IN ('korea_stock', 'united_states_stock', 'equity_future', 'index_future', 'crypto_spot', 'crypto_perpetual')),
+                 algorithm TEXT NOT NULL CHECK(algorithm IN ('lightgbm', 'xgboost', 'chronos', 'timesfm')),
+                 artifact_format TEXT NOT NULL CHECK(artifact_format IN ('lightgbm_text', 'xgboost_json', 'safetensors', 'onnx')),
+                 artifact_sha256 TEXT NOT NULL CHECK(length(artifact_sha256) = 64),
+                 status TEXT NOT NULL CHECK(status = 'candidate_review'),
+                 metrics_json TEXT NOT NULL CHECK(length(metrics_json) BETWEEN 2 AND 100000),
+                 record_json TEXT NOT NULL CHECK(length(record_json) BETWEEN 2 AND 1000000),
+                 created_at_ms INTEGER NOT NULL CHECK(created_at_ms > 0),
+                 PRIMARY KEY(model_id, model_version)
+             ) STRICT;
+             CREATE INDEX IF NOT EXISTS ml_model_versions_created
+                 ON ml_model_versions(created_at_ms DESC, model_id, model_version);
              CREATE TABLE IF NOT EXISTS remote_control_policy (
                  id INTEGER PRIMARY KEY NOT NULL CHECK(id = 1),
                  enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
@@ -760,6 +887,75 @@ fn initialize(connection: &Connection) -> Result<(), String> {
              ) STRICT;
              INSERT OR IGNORE INTO workspace_preferences(singleton_id, preferences_json, updated_at_ms)
              VALUES(1, '{\"displayTimezone\":\"Asia/Seoul\",\"quietHoursStart\":23,\"quietHoursEnd\":7,\"staleAfterSeconds\":300,\"notifyWarning\":true,\"notifyCritical\":true}', 0);
+             CREATE TABLE IF NOT EXISTS market_stream_checkpoints (
+                 stream_id TEXT PRIMARY KEY NOT NULL CHECK(length(stream_id) BETWEEN 1 AND 64),
+                 state_json TEXT NOT NULL CHECK(length(state_json) BETWEEN 2 AND 2000000),
+                 updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms > 0)
+             ) STRICT;
+             CREATE TABLE IF NOT EXISTS pit_provider_pages (
+                 page_id TEXT PRIMARY KEY NOT NULL CHECK(length(page_id) = 64),
+                 provider TEXT NOT NULL CHECK(provider IN ('upbit_spot','binance_spot','binance_usdm','binance_coinm')),
+                 symbol TEXT NOT NULL CHECK(length(symbol) BETWEEN 5 AND 32),
+                 interval TEXT NOT NULL CHECK(interval IN ('minute1','minute3','minute5','minute15','minute30','hour1','hour4','day1')),
+                 requested_start_ms INTEGER NOT NULL CHECK(requested_start_ms > 0),
+                 requested_end_exclusive_ms INTEGER NOT NULL CHECK(requested_end_exclusive_ms > requested_start_ms),
+                 page_json TEXT NOT NULL CHECK(length(page_json) BETWEEN 2 AND 16777216),
+                 fetched_at_ms INTEGER NOT NULL CHECK(fetched_at_ms > 0)
+             ) STRICT;
+             CREATE INDEX IF NOT EXISTS pit_provider_pages_lookup
+                 ON pit_provider_pages(provider, symbol, interval, requested_start_ms, requested_end_exclusive_ms);
+             CREATE TABLE IF NOT EXISTS pit_price_observations (
+                 record_id TEXT PRIMARY KEY NOT NULL CHECK(length(record_id) BETWEEN 1 AND 256),
+                 provider TEXT NOT NULL CHECK(provider IN ('upbit_spot','binance_spot','binance_usdm','binance_coinm')),
+                 symbol TEXT NOT NULL CHECK(length(symbol) BETWEEN 5 AND 32),
+                 interval TEXT NOT NULL CHECK(interval IN ('minute1','minute3','minute5','minute15','minute30','hour1','hour4','day1')),
+                 bar_end_ms INTEGER NOT NULL CHECK(bar_end_ms > 0),
+                 available_at_ms INTEGER NOT NULL CHECK(available_at_ms >= bar_end_ms),
+                 ingested_at_ms INTEGER NOT NULL CHECK(ingested_at_ms >= available_at_ms),
+                 source TEXT NOT NULL CHECK(length(source) BETWEEN 1 AND 64),
+                 source_revision TEXT NOT NULL CHECK(length(source_revision) = 71),
+                 close_scaled INTEGER NOT NULL CHECK(close_scaled > 0),
+                 price_scale INTEGER NOT NULL CHECK(price_scale > 0),
+                 final_bar INTEGER NOT NULL CHECK(final_bar = 1),
+                 UNIQUE(provider, symbol, interval, bar_end_ms)
+             ) STRICT;
+             CREATE INDEX IF NOT EXISTS pit_price_observations_lookup
+                 ON pit_price_observations(provider, symbol, interval, bar_end_ms);
+             CREATE TABLE IF NOT EXISTS pit_collection_jobs (
+                 job_id TEXT PRIMARY KEY NOT NULL CHECK(length(job_id) BETWEEN 1 AND 128),
+                 idempotency_key TEXT NOT NULL UNIQUE CHECK(length(idempotency_key) BETWEEN 1 AND 128),
+                 request_hash TEXT NOT NULL CHECK(length(request_hash) = 64),
+                 provider TEXT NOT NULL CHECK(provider IN ('upbit_spot','binance_spot','binance_usdm','binance_coinm')),
+                 symbol TEXT NOT NULL CHECK(length(symbol) BETWEEN 5 AND 32),
+                 interval TEXT NOT NULL CHECK(interval IN ('minute1','minute3','minute5','minute15','minute30','hour1','hour4','day1')),
+                 requested_start_ms INTEGER NOT NULL CHECK(requested_start_ms > 0),
+                 requested_end_exclusive_ms INTEGER NOT NULL CHECK(requested_end_exclusive_ms > requested_start_ms),
+                 page_size INTEGER NOT NULL CHECK(page_size BETWEEN 1 AND 1000),
+                 status TEXT NOT NULL CHECK(status IN ('queued','running','retry_wait','completed','failed','cancelled')),
+                 cursor_start_ms INTEGER NOT NULL CHECK(cursor_start_ms >= requested_start_ms),
+                 cursor_end_exclusive_ms INTEGER NOT NULL CHECK(cursor_end_exclusive_ms <= requested_end_exclusive_ms),
+                 page_count INTEGER NOT NULL DEFAULT 0 CHECK(page_count >= 0),
+                 observation_count INTEGER NOT NULL DEFAULT 0 CHECK(observation_count >= 0),
+                 failure_count INTEGER NOT NULL DEFAULT 0 CHECK(failure_count BETWEEN 0 AND 4),
+                 next_retry_at_ms INTEGER CHECK(next_retry_at_ms IS NULL OR next_retry_at_ms > 0),
+                 last_error TEXT CHECK(last_error IS NULL OR length(last_error) BETWEEN 1 AND 500),
+                 created_at_ms INTEGER NOT NULL CHECK(created_at_ms > 0),
+                 updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= created_at_ms)
+             ) STRICT;
+             CREATE INDEX IF NOT EXISTS pit_collection_jobs_status
+                 ON pit_collection_jobs(status, next_retry_at_ms, updated_at_ms);
+             CREATE TABLE IF NOT EXISTS pit_provider_rate_limits (
+                 provider TEXT PRIMARY KEY NOT NULL CHECK(provider IN ('upbit_spot','binance_spot','binance_usdm','binance_coinm')),
+                 next_allowed_at_ms INTEGER NOT NULL CHECK(next_allowed_at_ms > 0)
+             ) STRICT;
+             CREATE TABLE IF NOT EXISTS pit_collection_job_events (
+                 job_id TEXT NOT NULL REFERENCES pit_collection_jobs(job_id),
+                 event_index INTEGER NOT NULL CHECK(event_index >= 0),
+                 event_type TEXT NOT NULL CHECK(event_type IN ('created','claimed','recovered','page_stored','retry_scheduled','completed','failed','cancelled','released')),
+                 detail_json TEXT NOT NULL CHECK(length(detail_json) BETWEEN 2 AND 4000),
+                 occurred_at_ms INTEGER NOT NULL CHECK(occurred_at_ms > 0),
+                 PRIMARY KEY(job_id, event_index)
+             ) STRICT;
              ",
         )
         .map_err(|error| storage_error("로컬 연구 저장소를 초기화하지 못했습니다", error))?;
@@ -2316,6 +2512,27 @@ mod tests {
             )
             .expect("new futures market should pass the constraint");
         assert_eq!(legacy_count, 1);
+    }
+
+    #[test]
+    fn upgrades_version_twenty_one_with_market_stream_checkpoints() {
+        let connection = Connection::open_in_memory().expect("database should open");
+        connection
+            .pragma_update(None, "user_version", 21)
+            .expect("legacy version");
+        initialize(&connection).expect("migration should succeed");
+        let table_count: u64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='market_stream_checkpoints'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("checkpoint table");
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version");
+        assert_eq!(table_count, 1);
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     #[test]

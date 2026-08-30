@@ -32,5 +32,8 @@ base64 = "0.22"
 hmac = "0.12"
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
+futures-util = "0.3"
+tokio = { version = "1", features = ["time"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "native-tls"] }
 grammers-client = { version = "0.10.0", default-features = false }
 grammers-session = { version = "0.10.0", default-features = false, features = ["serde"] }

@@ -1,7 +1,12 @@
+use std::{
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
+
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 
 use crate::{
     backtest::latest_signal,
@@ -128,6 +133,7 @@ struct StoredExperiment {
     trace_id: String,
     symbol: String,
     currency: String,
+    interval: String,
     record: Value,
 }
 
@@ -152,7 +158,7 @@ fn load_experiment(
         .map_err(|_| "로컬 저장소 잠금을 획득하지 못했습니다.".to_owned())?;
     let row = connection
         .query_row(
-            "SELECT b.trace_id, b.symbol, b.currency, b.record_json
+            "SELECT b.trace_id, b.symbol, b.currency, b.interval, b.record_json
              FROM backtest_runs b
              WHERE b.experiment_id = ?1",
             params![experiment_id],
@@ -162,18 +168,20 @@ fn load_experiment(
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
                 ))
             },
         )
         .optional()
         .map_err(|error| format!("저장된 백테스트를 조회하지 못했습니다: {error}"))?
         .ok_or_else(|| "선택한 백테스트 기록을 찾지 못했습니다.".to_owned())?;
-    let record: Value = serde_json::from_str(&row.3)
+    let record: Value = serde_json::from_str(&row.4)
         .map_err(|error| format!("백테스트 기록을 해석하지 못했습니다: {error}"))?;
     Ok(StoredExperiment {
         trace_id: row.0,
         symbol: row.1,
         currency: row.2,
+        interval: row.3,
         record,
     })
 }
@@ -808,6 +816,66 @@ pub struct ShadowRuntimeStatus {
     pub message: String,
 }
 
+/// 섀도우 감시는 UI 수명과 분리되어야 한다. 이 상태는 프로세스 안에서
+/// 백그라운드 루프의 중복 시작과 동시 tick을 막을 뿐 주문 권한을 갖지 않는다.
+pub struct ShadowEngineRuntime {
+    started: AtomicBool,
+    tick_in_progress: AtomicBool,
+}
+
+impl Default for ShadowEngineRuntime {
+    fn default() -> Self {
+        Self {
+            started: AtomicBool::new(false),
+            tick_in_progress: AtomicBool::new(false),
+        }
+    }
+}
+
+struct ShadowTickGuard<'a>(&'a AtomicBool);
+
+impl Drop for ShadowTickGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+impl ShadowEngineRuntime {
+    fn begin_tick(&self) -> Option<ShadowTickGuard<'_>> {
+        self.tick_in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| ShadowTickGuard(&self.tick_in_progress))
+    }
+}
+
+const SHADOW_SCHEDULER_POLL_SECONDS: u64 = 5;
+
+/// 저장된 감시 항목은 SQLite에 남아 있으므로 앱 재시작 뒤에도 자동으로 재개한다.
+/// 전용 blocking worker에서만 대기하고, 실제 네트워크 작업은 Tauri async runtime에
+/// 위임한다. 외부 주문 전송은 이 경로에 존재하지 않는다.
+pub fn start_shadow_engine(app: AppHandle) {
+    let runtime = app.state::<ShadowEngineRuntime>();
+    if runtime.started.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    drop(runtime);
+
+    tauri::async_runtime::spawn_blocking(move || loop {
+        std::thread::sleep(Duration::from_secs(SHADOW_SCHEDULER_POLL_SECONDS));
+        let result = tauri::async_runtime::block_on(async {
+            let market = app.state::<MarketDataBridge>();
+            let crypto = app.state::<CryptoMarketBridge>();
+            let persistence = app.state::<PersistenceBridge>();
+            let runtime = app.state::<ShadowEngineRuntime>();
+            run_shadow_engine_once(&market, &crypto, &persistence, &runtime).await
+        });
+        if let Err(error) = result {
+            eprintln!("섀도우 백그라운드 감시 오류: {error}");
+        }
+    });
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShadowWatchRequest {
@@ -844,20 +912,7 @@ fn load_watches(persistence: &PersistenceBridge) -> Result<Vec<ShadowWatch>, Str
 pub fn shadow_runtime_status(
     persistence: State<'_, PersistenceBridge>,
 ) -> Result<ShadowRuntimeStatus, String> {
-    let watches = load_watches(&persistence)?;
-    let enabled_watch_count = watches.iter().filter(|watch| watch.enabled).count();
-    Ok(ShadowRuntimeStatus {
-        running: enabled_watch_count > 0,
-        enabled_watch_count,
-        watches,
-        live_order_enabled: false,
-        message: if enabled_watch_count > 0 {
-            "저장 전략의 완료 봉 신호를 감시 중입니다. 후보 생성 뒤 사용자 승인이 필요합니다."
-                .to_owned()
-        } else {
-            "활성화된 섀도우 감시가 없습니다.".to_owned()
-        },
-    })
+    shadow_runtime_status_from_bridge(&persistence)
 }
 
 #[tauri::command]
@@ -917,21 +972,29 @@ fn update_watch(
     Ok(())
 }
 
-#[tauri::command]
-pub async fn shadow_engine_tick(
-    market: State<'_, MarketDataBridge>,
-    crypto: State<'_, CryptoMarketBridge>,
-    persistence: State<'_, PersistenceBridge>,
+fn shadow_watch_is_due(watch: &ShadowWatch, now: u64) -> bool {
+    watch.enabled
+        && watch
+            .last_checked_at_ms
+            .is_none_or(|last| now.saturating_sub(last) >= watch.interval_seconds * 1_000)
+}
+
+async fn run_shadow_engine_once(
+    market: &MarketDataBridge,
+    crypto: &CryptoMarketBridge,
+    persistence: &PersistenceBridge,
+    runtime: &ShadowEngineRuntime,
 ) -> Result<ShadowRuntimeStatus, String> {
+    let Some(_tick_guard) = runtime.begin_tick() else {
+        return shadow_runtime_status_from_bridge(persistence);
+    };
     let now = persistence::now_ms()?;
-    for watch in load_watches(&persistence)?.into_iter().filter(|watch| {
-        watch.enabled
-            && watch
-                .last_checked_at_ms
-                .is_none_or(|last| now.saturating_sub(last) >= watch.interval_seconds * 1_000)
-    }) {
+    for watch in load_watches(persistence)?
+        .into_iter()
+        .filter(|watch| shadow_watch_is_due(watch, now))
+    {
         let result = async {
-            let experiment = load_experiment(&persistence, &watch.experiment_id)?;
+            let experiment = load_experiment(persistence, &watch.experiment_id)?;
             validate_experiment(&experiment)?;
             let spec: StrategySpec = serde_json::from_value(
                 experiment
@@ -946,15 +1009,17 @@ pub async fn shadow_engine_tick(
             }
             let is_crypto = experiment.symbol.starts_with("KRW-");
             let fresh_bars = if is_crypto {
-                crypto.fetch_strategy_bars(&experiment.symbol).await?
+                crypto
+                    .fetch_strategy_bars(&experiment.symbol, &experiment.interval)
+                    .await?
             } else {
                 market
-                    .fetch_latest_strategy_bars(&experiment.symbol)
+                    .fetch_latest_strategy_bars(&experiment.symbol, &experiment.interval)
                     .await?
             };
             let Some(side) = latest_signal(&spec, &fresh_bars).map_err(|error| error.message)?
             else {
-                update_watch(&persistence, &watch.watch_id, now, None, None)?;
+                update_watch(persistence, &watch.watch_id, now, None, None)?;
                 return Ok::<(), String>(());
             };
             let last = fresh_bars
@@ -965,7 +1030,7 @@ pub async fn shadow_engine_tick(
                 watch.experiment_id, side, last.period_start_ms
             );
             if watch.last_signal_key.as_deref() == Some(&signal_key) {
-                update_watch(&persistence, &watch.watch_id, now, None, None)?;
+                update_watch(persistence, &watch.watch_id, now, None, None)?;
                 return Ok(());
             }
             let (price, observed_at) = if is_crypto {
@@ -982,9 +1047,9 @@ pub async fn shadow_engine_tick(
             } else {
                 1
             };
-            let gate = safety_gate(&persistence, &experiment, side, quantity, price)?;
+            let gate = safety_gate(persistence, &experiment, side, quantity, price)?;
             insert_candidate(
-                &persistence,
+                persistence,
                 &watch.experiment_id,
                 &experiment,
                 side,
@@ -994,14 +1059,43 @@ pub async fn shadow_engine_tick(
                 "shadow_engine",
                 &gate,
             )?;
-            update_watch(&persistence, &watch.watch_id, now, Some(&signal_key), None)
+            update_watch(persistence, &watch.watch_id, now, Some(&signal_key), None)
         }
         .await;
         if let Err(error) = result {
-            update_watch(&persistence, &watch.watch_id, now, None, Some(&error))?;
+            update_watch(persistence, &watch.watch_id, now, None, Some(&error))?;
         }
     }
-    shadow_runtime_status(persistence)
+    shadow_runtime_status_from_bridge(persistence)
+}
+
+fn shadow_runtime_status_from_bridge(
+    persistence: &PersistenceBridge,
+) -> Result<ShadowRuntimeStatus, String> {
+    let watches = load_watches(persistence)?;
+    let enabled_watch_count = watches.iter().filter(|watch| watch.enabled).count();
+    Ok(ShadowRuntimeStatus {
+        running: enabled_watch_count > 0,
+        enabled_watch_count,
+        watches,
+        live_order_enabled: false,
+        message: if enabled_watch_count > 0 {
+            "Rust 백그라운드 엔진이 저장 전략의 완료 봉 신호를 감시 중입니다. 후보 생성 뒤 사용자 승인이 필요합니다."
+                .to_owned()
+        } else {
+            "활성화된 섀도우 감시가 없습니다.".to_owned()
+        },
+    })
+}
+
+#[tauri::command]
+pub async fn shadow_engine_tick(
+    market: State<'_, MarketDataBridge>,
+    crypto: State<'_, CryptoMarketBridge>,
+    persistence: State<'_, PersistenceBridge>,
+    runtime: State<'_, ShadowEngineRuntime>,
+) -> Result<ShadowRuntimeStatus, String> {
+    run_shadow_engine_once(&market, &crypto, &persistence, &runtime).await
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1211,6 +1305,66 @@ pub fn meeting_workflow_interrupted(
     recover_interrupted_workflows(persistence.inner(), persistence::now_ms()?)
 }
 
+fn resume_interrupted_workflow(
+    persistence: &PersistenceBridge,
+    job_id: &str,
+    now: u64,
+) -> Result<WorkflowJob, String> {
+    if !valid_id(job_id) {
+        return Err("재개할 회의 작업 식별자가 올바르지 않습니다.".to_owned());
+    }
+    let connection = persistence
+        .connection
+        .lock()
+        .map_err(|_| "로컬 저장소 잠금을 획득하지 못했습니다.".to_owned())?;
+    let changed = connection
+        .execute(
+            "UPDATE workflow_jobs SET status = 'active', updated_at_ms = ?2 WHERE job_id = ?1 AND status = 'interrupted'",
+            params![job_id, now],
+        )
+        .map_err(|error| format!("중단 회의를 재개하지 못했습니다: {error}"))?;
+    if changed == 0 {
+        return Err("재개할 중단 회의 기록을 찾지 못했습니다.".to_owned());
+    }
+    let row = connection
+        .query_row(
+            "SELECT job_id, topic, importance, stage, status, selected_departments_json, reports_json, synthesis_json, created_at_ms, updated_at_ms FROM workflow_jobs WHERE job_id = ?1",
+            params![job_id],
+            workflow_from_row,
+        )
+        .map_err(|error| format!("재개된 회의 기록을 읽지 못했습니다: {error}"))?;
+    Ok(WorkflowJob {
+        job_id: row.0,
+        topic: row.1,
+        importance: row.2,
+        stage: row.3,
+        status: row.4,
+        selected_department_ids: serde_json::from_str(&row.5)
+            .map_err(|error| format!("저장 부서 목록을 해석하지 못했습니다: {error}"))?,
+        reports: serde_json::from_str(&row.6)
+            .map_err(|error| format!("저장 보고를 해석하지 못했습니다: {error}"))?,
+        synthesis: row
+            .7
+            .map(|value| serde_json::from_str(&value))
+            .transpose()
+            .map_err(|error| format!("저장 종합 보고를 해석하지 못했습니다: {error}"))?,
+        created_at_ms: row.8,
+        updated_at_ms: row.9,
+    })
+}
+
+#[tauri::command]
+pub fn meeting_workflow_resume(
+    request: CandidateActionRequest,
+    persistence: State<'_, PersistenceBridge>,
+) -> Result<WorkflowJob, String> {
+    resume_interrupted_workflow(
+        persistence.inner(),
+        &request.candidate_id,
+        persistence::now_ms()?,
+    )
+}
+
 #[tauri::command]
 pub fn meeting_workflow_dismiss(
     request: CandidateActionRequest,
@@ -1273,6 +1427,38 @@ mod tests {
     }
 
     #[test]
+    fn shadow_watch_due_boundary_is_deterministic() {
+        let watch = ShadowWatch {
+            watch_id: "watch-test".to_owned(),
+            experiment_id: "experiment-test".to_owned(),
+            enabled: true,
+            interval_seconds: 60,
+            last_checked_at_ms: Some(100_000),
+            last_signal_key: None,
+            status: "watching".to_owned(),
+            last_error: None,
+        };
+        assert!(!shadow_watch_is_due(&watch, 159_999));
+        assert!(shadow_watch_is_due(&watch, 160_000));
+        assert!(!shadow_watch_is_due(
+            &ShadowWatch {
+                enabled: false,
+                ..watch
+            },
+            200_000
+        ));
+    }
+
+    #[test]
+    fn shadow_tick_runtime_rejects_overlap_and_releases_after_guard_drop() {
+        let runtime = ShadowEngineRuntime::default();
+        let guard = runtime.begin_tick().expect("first tick");
+        assert!(runtime.begin_tick().is_none());
+        drop(guard);
+        assert!(runtime.begin_tick().is_some());
+    }
+
+    #[test]
     fn operational_tables_are_created_by_the_non_destructive_migration() {
         let persistence = PersistenceBridge::in_memory().expect("database");
         let connection = persistence.connection.lock().expect("connection");
@@ -1314,5 +1500,85 @@ mod tests {
         let second = recover_interrupted_workflows(&persistence, 4).expect("repeat recover");
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].reports, first[0].reports);
+    }
+
+    #[test]
+    fn interrupted_meeting_resume_keeps_completed_reports_and_original_job_id() {
+        let persistence = PersistenceBridge::in_memory().expect("database");
+        {
+            let connection = persistence.connection.lock().expect("connection");
+            connection.execute(
+                "INSERT INTO workflow_jobs(job_id,topic,importance,stage,status,selected_departments_json,reports_json,synthesis_json,created_at_ms,updated_at_ms) VALUES('resume-1','체크포인트 재개','important','department-analysis','interrupted','[\"research\",\"risk\"]','{\"research-director\":{\"summary\":\"완료 보고\"}}',NULL,1,2)",
+                [],
+            ).expect("fixture");
+        }
+        let resumed = resume_interrupted_workflow(&persistence, "resume-1", 3).expect("resume");
+        assert_eq!(resumed.job_id, "resume-1");
+        assert_eq!(resumed.status, "active");
+        assert_eq!(resumed.stage, "department-analysis");
+        assert_eq!(resumed.reports["research-director"]["summary"], "완료 보고");
+        assert!(resume_interrupted_workflow(&persistence, "resume-1", 4).is_err());
+    }
+
+    #[test]
+    fn meeting_recovery_survives_one_hundred_interrupt_resume_cycles() {
+        let persistence = PersistenceBridge::in_memory().expect("database");
+        for cycle in 0_u64..100 {
+            let job_id = format!("soak-{cycle}");
+            {
+                let connection = persistence.connection.lock().expect("connection");
+                connection
+                    .execute(
+                        "INSERT INTO workflow_jobs(job_id,topic,importance,stage,status,selected_departments_json,reports_json,synthesis_json,created_at_ms,updated_at_ms) VALUES(?1,'회의 복구 반복 검증','important','department-analysis','active','[\"research\",\"risk\"]',?2,NULL,?3,?3)",
+                        params![
+                            job_id,
+                            format!(r#"{{"research":{{"summary":"cycle-{cycle}"}}}}"#),
+                            cycle.saturating_mul(10).saturating_add(1),
+                        ],
+                    )
+                    .expect("fixture");
+            }
+            let interrupted = recover_interrupted_workflows(
+                &persistence,
+                cycle.saturating_mul(10).saturating_add(2),
+            )
+            .expect("recover");
+            let recovered = interrupted
+                .iter()
+                .find(|job| job.job_id == job_id)
+                .expect("current interrupted workflow");
+            assert_eq!(
+                recovered.reports["research"]["summary"],
+                format!("cycle-{cycle}")
+            );
+
+            let resumed = resume_interrupted_workflow(
+                &persistence,
+                &job_id,
+                cycle.saturating_mul(10).saturating_add(3),
+            )
+            .expect("resume");
+            assert_eq!(resumed.stage, "department-analysis");
+            assert_eq!(resumed.selected_department_ids, vec!["research", "risk"]);
+
+            let connection = persistence.connection.lock().expect("connection");
+            let changed = connection
+                .execute(
+                    "UPDATE workflow_jobs SET stage='results', status='completed', updated_at_ms=?2 WHERE job_id=?1 AND status='active'",
+                    params![job_id, cycle.saturating_mul(10).saturating_add(4)],
+                )
+                .expect("complete");
+            assert_eq!(changed, 1);
+        }
+
+        let connection = persistence.connection.lock().expect("connection");
+        let completed: u64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM workflow_jobs WHERE status='completed'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("completed count");
+        assert_eq!(completed, 100);
     }
 }

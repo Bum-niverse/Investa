@@ -1,3 +1,4 @@
+pub mod ai_providers;
 pub mod backtest;
 pub mod binance;
 pub mod cloud_relay;
@@ -8,6 +9,7 @@ pub mod data_pipeline;
 pub mod data_quality;
 pub mod decision;
 pub mod engine_runtime;
+pub mod execution_algorithms;
 pub mod execution_control;
 pub mod experiments;
 pub mod external_links;
@@ -17,8 +19,12 @@ pub mod futures_paper;
 pub mod github_auth;
 pub mod governance;
 pub mod kis_paper;
+pub mod local_security;
 pub mod manual_orders;
+pub mod market_aggregation;
 pub mod market_data;
+pub mod ml_pipeline;
+pub mod ml_worker_runner;
 pub mod operational_controls;
 pub mod operational_readiness;
 pub mod operations;
@@ -28,6 +34,8 @@ pub mod paper_trading;
 pub mod pattern_probability;
 pub mod performance;
 pub mod persistence;
+pub mod pit_dataset;
+pub mod pit_providers;
 pub mod publicity;
 pub mod quant_risk;
 pub mod reference;
@@ -38,24 +46,38 @@ pub mod runtime_ops;
 pub mod screening;
 pub mod sec_fundamentals;
 pub mod simulation;
+pub mod social_auth;
+pub mod strategy_deployment;
+pub mod strategy_plugins;
 pub mod strategy_protection;
 pub mod telegram;
+pub mod toss_stream;
 pub mod trading;
+pub mod workspace_identity;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .manage(codex::CodexBridge::default())
+        .manage(ai_providers::AiProviderBridge::default())
         .manage(binance::BinanceBridge::default())
         .manage(crypto_market::CryptoMarketBridge::default())
         .manage(market_data::MarketDataBridge::default())
         .manage(reference::ReferenceFetcher::default())
         .manage(sec_fundamentals::SecFundamentalsBridge::default())
         .manage(telegram::TelegramBridge::default())
+        .manage(workspace_identity::WorkspaceIdentityBridge::default())
+        .manage(operations::ShadowEngineRuntime::default())
+        .manage(market_aggregation::MarketAggregationBridge::default())
+        .manage(toss_stream::TossMarketStreamBridge::default())
+        .manage(pit_providers::PitProviderBridge::default())
+        .manage(pit_providers::PitCollectionRuntime::default())
         .setup(|app| {
             use tauri::Manager;
 
-            let database_path = app.path().app_data_dir()?.join("investa.sqlite3");
+            let app_data_dir = app.path().app_data_dir()?;
+            local_security::harden_app_data(&app_data_dir).map_err(std::io::Error::other)?;
+            let database_path = app_data_dir.join("investa.sqlite3");
             let persistence = persistence::PersistenceBridge::open(&database_path)
                 .map_err(std::io::Error::other)?;
             runtime_ops::mark_runtime_reconciliation_required(
@@ -65,19 +87,27 @@ pub fn run() {
             .map_err(std::io::Error::other)?;
             app.manage(persistence);
             cloud_relay::start_polling(app.handle().clone());
+            operations::start_shadow_engine(app.handle().clone());
+            pit_providers::start_collection_scheduler(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            ai_providers::ai_provider_statuses,
+            ai_providers::ai_provider_save_config,
+            ai_providers::ai_provider_delete_config,
+            ai_providers::ai_provider_run_analysis,
             codex::codex_status,
             codex::codex_start_turn,
             codex::codex_cancel_turn,
             codex::codex_usage_status,
             binance::binance_connection_status,
             binance::binance_public_snapshot,
+            binance::binance_perpetual_analysis_snapshot,
             binance::binance_save_credentials,
             binance::binance_account_snapshot,
             binance::binance_delete_credentials,
             crypto_market::upbit_chart_snapshot,
+            crypto_market::upbit_analysis_snapshot,
             crypto_market::upbit_market_quote,
             crypto_market::upbit_run_research_backtest,
             crypto_market::upbit_execute_paper_market_order,
@@ -108,9 +138,39 @@ pub fn run() {
             forecast_runtime::probability_forecast_save,
             forecast_runtime::forecast_calibration_save,
             forecast_runtime::probability_forecast_history,
+            ml_pipeline::ml_dataset_manifest_create,
+            ml_pipeline::ml_dataset_shard_set_create,
+            ml_pipeline::ml_dataset_shard_set_detail,
+            ml_pipeline::ml_dataset_shard_set_history,
+            ml_pipeline::ml_training_job_prepare,
+            ml_pipeline::ml_training_job_bundle,
+            ml_pipeline::ml_training_job_complete,
+            ml_pipeline::ml_pipeline_history,
+            pit_dataset::pit_collection_plan_create,
+            pit_dataset::pit_dataset_build_preview,
+            pit_dataset::pit_dataset_build_commit,
+            pit_dataset::pit_stored_dataset_build_preview,
+            pit_dataset::pit_stored_dataset_build_commit,
+            pit_providers::pit_provider_page_fetch,
+            pit_providers::pit_provider_page_fetch_store,
+            pit_providers::pit_provider_stored_range,
+            pit_providers::pit_collection_job_create,
+            pit_providers::pit_collection_job_run,
+            pit_providers::pit_collection_job_cancel,
+            pit_providers::pit_collection_job_detail,
+            pit_providers::pit_collection_job_history,
+            ml_worker_runner::ml_training_job_run,
             github_auth::github_session,
             github_auth::github_login_start,
+            github_auth::github_link_current_session,
+            social_auth::social_auth_status,
+            social_auth::social_auth_save_google_client,
+            social_auth::social_auth_delete_google_client,
+            social_auth::google_login,
+            social_auth::google_link_account,
+            workspace_identity::workspace_identity_status,
             market_data::market_indices_snapshot,
+            market_data::toss_market_calendars,
             market_data::toss_chart_snapshot,
             market_data::toss_analysis_snapshot,
             market_data::toss_market_quote,
@@ -121,9 +181,22 @@ pub fn run() {
             market_data::toss_execute_paper_market_order,
             market_data::toss_save_credentials,
             market_data::toss_delete_credentials,
+            market_aggregation::market_stream_tick_ingest,
+            market_aggregation::market_stream_gap_backfill,
+            market_aggregation::market_stream_aggregation_flush,
+            market_aggregation::market_stream_aggregation_status,
+            toss_stream::toss_market_stream_start,
+            toss_stream::toss_market_stream_stop,
+            toss_stream::toss_market_stream_status,
             manual_orders::manual_paper_limit_order_submit,
             manual_orders::manual_paper_orders,
             manual_orders::manual_paper_order_cancel,
+            execution_algorithms::internal_execution_create,
+            execution_algorithms::internal_execution_fill,
+            execution_algorithms::internal_execution_reprice,
+            execution_algorithms::internal_execution_cancel,
+            execution_algorithms::internal_execution_expire,
+            execution_algorithms::internal_execution_get,
             orchestration::agenda_execution_policy,
             operations::paper_order_candidate_create,
             operations::paper_order_candidates,
@@ -137,6 +210,7 @@ pub fn run() {
             operations::meeting_workflow_start,
             operations::meeting_workflow_checkpoint,
             operations::meeting_workflow_interrupted,
+            operations::meeting_workflow_resume,
             operations::meeting_workflow_dismiss,
             operational_readiness::workspace_preferences_get,
             operational_readiness::workspace_preferences_save,
@@ -146,6 +220,7 @@ pub fn run() {
             operational_readiness::paper_exit_reason_resolve,
             operational_readiness::shadow_soak_audit,
             operational_readiness::shadow_soak_audit_save,
+            operational_readiness::shadow_soak_sample,
             operational_readiness::operations_dashboard_snapshot,
             operational_controls::paper_risk_monitor_evaluate,
             operational_controls::trade_quality_analyze,
@@ -175,6 +250,8 @@ pub fn run() {
             paper_trading::paper_accounts_status,
             paper_trading::toss_order_adapter_status,
             kis_paper::kis_paper_config_status,
+            kis_paper::kis_futures_connection_status,
+            kis_paper::kis_futures_analysis_snapshot,
             kis_paper::kis_paper_config_save,
             kis_paper::kis_paper_config_delete,
             kis_paper::kis_paper_account_snapshot,
@@ -207,11 +284,23 @@ pub fn run() {
             risk_policy::risk_policy_approve,
             risk_policy::risk_policy_status,
             sec_fundamentals::sec_connection_status,
+            sec_fundamentals::sec_connection_probe,
             sec_fundamentals::sec_save_contact,
             sec_fundamentals::sec_delete_contact,
             strategy_protection::strategy_protection_evaluate,
             strategy_protection::strategy_protection_history,
             strategy_protection::strategy_protection_alerts_sync,
+            strategy_plugins::strategy_plugin_catalog,
+            strategy_plugins::strategy_plugin_validate,
+            strategy_plugins::strategy_cadence_catalog,
+            strategy_plugins::strategy_cadence_validate,
+            strategy_deployment::strategy_deployment_candidate_create,
+            strategy_deployment::strategy_deployment_canary_approve,
+            strategy_deployment::strategy_deployment_canary_observe,
+            strategy_deployment::strategy_deployment_paper_approve,
+            strategy_deployment::strategy_deployment_rollback,
+            strategy_deployment::strategy_deployment_reject,
+            strategy_deployment::strategy_deployment_history,
             telegram::telegram_connection_status,
             telegram::telegram_save_credentials,
             telegram::telegram_login_start,

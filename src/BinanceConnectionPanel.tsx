@@ -18,6 +18,8 @@ export type BinanceAccountSnapshot = {
   provider: string;
   fetchedAtMs: number;
   readOnly: boolean;
+  permissionVerified: boolean;
+  permissionMessage: string;
   spot: BinanceAccountSection;
   usdM: BinanceAccountSection;
   coinM: BinanceAccountSection;
@@ -32,13 +34,14 @@ type BinancePublicSnapshot = {
 
 type Props = {
   status: BinanceConnectionStatus;
+  refreshedSnapshot?: BinanceAccountSnapshot | null;
   onStatusChange: (status: BinanceConnectionStatus, snapshot?: BinanceAccountSnapshot | null) => void;
 };
 
 const isTauriRuntime = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 const formatValue = (value: string) => Number(value).toLocaleString("ko-KR", { maximumFractionDigits: 8 });
 
-export function BinanceConnectionPanel({ status, onStatusChange }: Props) {
+export function BinanceConnectionPanel({ status, refreshedSnapshot, onStatusChange }: Props) {
   const [apiKey, setApiKey] = useState("");
   const [secretKey, setSecretKey] = useState("");
   const [publicSnapshot, setPublicSnapshot] = useState<BinancePublicSnapshot | null>(null);
@@ -55,6 +58,10 @@ export function BinanceConnectionPanel({ status, onStatusChange }: Props) {
       .catch(() => { if (!disposed) { setPublicSnapshot(null); setPublicError("Binance 공개 시세를 확인하지 못했습니다."); } });
     return () => { disposed = true; };
   }, []);
+
+  useEffect(() => {
+    if (refreshedSnapshot !== undefined) setAccountSnapshot(refreshedSnapshot);
+  }, [refreshedSnapshot]);
 
   const save = async (event: FormEvent) => {
     event.preventDefault();
@@ -132,7 +139,7 @@ export function BinanceConnectionPanel({ status, onStatusChange }: Props) {
       {status.configured && <button className="settings-danger" type="button" onClick={() => void remove()} disabled={busy}>Binance 연결 삭제</button>}
     </div>
     {accountSnapshot && <div className="settings-binance-sections" role="status">
-      <small>{new Date(accountSnapshot.fetchedAtMs).toLocaleString("ko-KR")} · 읽기 전용</small>
+      <small>{new Date(accountSnapshot.fetchedAtMs).toLocaleString("ko-KR")} · {accountSnapshot.permissionVerified ? accountSnapshot.permissionMessage : "권한 미검증"}</small>
       {sections.map(([label, section]) => <article className={section?.connected ? "is-connected" : "is-empty"} key={label}>
         <header><strong>{label}</strong><b>{section?.connected ? "조회 가능" : "미활성·권한 없음"}</b></header>
         <p>{section?.message}</p>

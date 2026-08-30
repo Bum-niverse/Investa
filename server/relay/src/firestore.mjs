@@ -106,7 +106,10 @@ export class FirestoreRepository {
   }
 
   async claimOldest(deviceId, nowMs, leaseSeconds) {
-    const jobs = (await this.availableJobs()).filter((job) => job.status === "queued" || Number(job.leaseExpiresAtMs ?? 0) <= nowMs);
+    const jobs = (await this.availableJobs()).filter((job) =>
+      Number(job.expiresAtMs ?? (Number(job.createdAtMs ?? 0) + 86_400_000)) > nowMs &&
+      (job.status === "queued" || Number(job.leaseExpiresAtMs ?? 0) <= nowMs)
+    );
     jobs.sort((left, right) => left.createdAtMs - right.createdAtMs || String(left.jobId).localeCompare(String(right.jobId)));
     for (const job of jobs) {
       try {

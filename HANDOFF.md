@@ -1,10 +1,18 @@
 # Investa Codex 인수인계
 
-기준일: 2026-08-26
+기준일: 2026-08-27
 
 대상: 새 노트북의 Codex
 
 저장소 목적: 현재 데스크톱 소스와 의사결정, 검증 상태, 남은 작업을 안전하게 이어받기 위한 단일 진입점
+
+최신 진행(2026-08-30): Codex App Server의 `model/list`를 세션 시작 때 조회해 현재 계정이 지원하는 모델·reasoning effort만 사용하도록 했다. 직원·부서 분석은 high, 본부장 최종 종합은 xhigh 목표 프로필이며 미지원 강도는 카탈로그 안에서만 하향한다. 최종 종합에 동일 기준 시각의 원본 근거 묶음을 다시 전달하고, 전달되지 않은 evidence ID를 만든 부서 보고는 실패로 닫는다. 읽기 전용·네트워크 차단·실주문 금지 경계는 유지한다. 기존 판단·실행 주기 계약과 ML 기준 모델 기각 상태도 변하지 않았다.
+
+회의 데이터 통합(2026-08-30): 전체 부서장 회의는 분류 뒤 시장·기술 스냅샷, 같은 종목의 익명화된 토스 보유 포지션과 선택 Telegram 근거를 한 번 수집해 모든 소집 부서가 재사용한다. 가격·기술·포지션·뉴스의 결정론적 근거 ID가 부서 보고와 본부장 종합에 유지되며, 국장 재무·공시는 OpenDART 미연결 항목만 결측으로 남는다. 계좌번호·계좌 별칭·자격정보는 Codex에 전달하지 않고 SHADOW ONLY에서 내부 모의주문 후보 검토만 허용한다.
+
+실시간 시장 전송(2026-08-31): 토스 인증 WebSocket을 Rust로 연결했다. access token은 handshake의 Authorization 헤더에만 사용하고 상태·React·로그에 노출하지 않는다. 체결·호가 topic만 허용하고 개인 주문 topic을 차단하며 60초 PING, ack timeout, backoff+jitter 재연결과 완료 봉 집계를 연결했다. 저장 자격정보로 공식 101 handshake, 국장 구독 ack와 즉시 PING/pong을 통과했지만 장중 KR/US 체결·호가, 60초 주기 장시간 PING/pong, 24시간 내구 검증은 남아 있다.
+
+내부 섀도우 내구 검사(2026-08-31): 운영 패널에서 1분 실제 표본 수집을 시작할 수 있다. Windows working set, SQLite 크기, 활성 섀도우 작업자, 내부 후보, SQLite·KRW·USD 원장 건강과 재시작 대사를 수집하며 3분 초과 공백은 fail-closed다. 앱 재시작 뒤에는 자동으로 표본을 만들지 않고 사용자가 `재시작 원장 대사 후 계속`을 눌러야 하며 실제 24시간 결과는 아직 미완료다.
 
 ## 1. 가장 먼저 할 일
 
@@ -33,7 +41,7 @@ Investa는 한국·미국 주식, 암호화폐, 증권 선물과 코인 선물�
 - 패키지 관리자: pnpm
 - AI: 로컬 Codex CLI/App Server 연결
 - 원격 운영: Node 22 Cloud Run relay + Firestore + Telegram Bot 기반
-- 인증 게이트: 설치된 GitHub CLI 세션의 사용자 확인. Investa는 GitHub token을 저장하지 않는다.
+- 인증 게이트: 최초 검증된 GitHub 또는 Google 계정이 통합 로컬 작업공간 소유자가 되고, 이후 계정은 소유자 세션에서 명시적으로 연결한다. Google Desktop OAuth PKCE를 지원하며 공급자 access/refresh token을 저장하지 않는다. Apple은 공식 HTTPS callback 준비 전 비활성이다.
 
 중요 경로:
 
@@ -54,11 +62,11 @@ Investa는 한국·미국 주식, 암호화폐, 증권 선물과 코인 선물�
 - 본부장 회의 안건의 Codex 자동 분류와 필수 안전 부서의 Rust 결정론적 보강
 - 관련 부서장 소집 → 부서 복귀·분석 → 완료된 부서장부터 재소집 → 본부장 종합
 - 추정 타이머가 아니라 Codex 시작·응답·계약 검증·완료 이벤트 기반 상태
-- 중단 회의 체크포인트, 닫기와 처음부터 안전 재실행
+- 중단 회의 체크포인트, 검증된 완료 보고 재사용, 남은 부서만 재개와 기록 닫기
 
 ### 분석과 근거
 
-- 토스증권 완료 수정주가 일봉 기반 point-in-time 분석 스냅샷
+- 토스증권 주식, Upbit 원화 현물, Binance USDⓈ-M 무기한선물 기반 point-in-time 분석 스냅샷
 - MA 5·20·60, RSI 14, ATR 14, 거래량과 수익률 등 결정론적 지표
 - 미장 SEC Company Facts와 Submissions 결합. 기준일 당일·이후 자료 제외
 - 선택한 Telegram 방송 채널의 읽기 전용 뉴스 수집, 리비전·관측 시각·출처 보존
@@ -81,11 +89,12 @@ Investa는 한국·미국 주식, 암호화폐, 증권 선물과 코인 선물�
 - `scripts/technicalChartEvidence.test.ts`
 - `docs/technical-chart-annotations.md`
 
-현재 한계: 이 불변 차트 근거 생성 경로는 토스 분석 스냅샷을 확보한 국장·미장 역할 중심이다. 코인·증권 선물·코인 선물에도 같은 계약을 적용하려면 각 자산 어댑터의 완료 봉과 snapshot ID를 공통 `AnalysisSnapshot`으로 정규화해야 한다. 값이나 선을 임시로 꾸며내면 안 된다.
+현재 상태: Upbit 현물과 Binance USDⓈ-M 무기한선물 공개 API는 공통 `AnalysisSnapshot`으로 정규화되어 기술분석 직원 차트 근거까지 연결됐다. 증권선물은 KIS 공식 모의 서버의 계약별 일봉 어댑터를 구현했으며 현재 만기 계약코드를 직접 입력한다. 이 PC에는 KIS 자격정보가 없어 실제 왕복은 미검증이고, 공식 응답에 없는 정산가·근월물 연결 정보는 꾸며내지 않는다.
 
 ### 백테스트·모의투자·위험 통제
 
 - 시점 정합 가격봉과 명시적 비용을 사용하는 결정론적 백테스트
+- 이동평균 교차·가격 채널 돌파·평균 이격 회귀·ATR 변동성 확장 v1 플러그인. 백테스트·섀도우 신호 공통 디스패처와 시장·주기·필드 사전 검증
 - 원본과 분리된 복제 실험, OOS·walk-forward·레짐 검증
 - PBO, MinTRL, 가격 기준선, Sharpe·Sortino, MDD, Profit Factor와 조건부 패턴 통계
 - KRW·USD 내부 모의계좌와 append-only SQLite 원장
@@ -100,12 +109,16 @@ Investa는 한국·미국 주식, 암호화폐, 증권 선물과 코인 선물�
 ### 외부 연결 상태
 
 - 토스증권: 지수·종목·캔들·계좌·보유자산 읽기 전용
+- 토스증권 공식 KR·US 장 캘린더: 휴장·부분 세션·미국 익일 종료 시각 정규화, 운영 화면 표시와 실제 왕복 검증 완료
 - Upbit: 공개 KRW 시장 데이터, 개인키 연결 시 자산 조회 전용
 - Binance: 공개 현물·USDⓈ-M·COIN-M 데이터, 개인키 연결 시 잔고·포지션 읽기 전용
+- 공개 실시간 스트림: Upbit ticker, Binance Spot ticker, USDⓈ-M·COIN-M mark/index/funding WebSocket과 stale·재연결·24시간 선제 교체 UI. 로컬 실제 수신은 Upbit·Spot·COIN-M 통과, USDⓈ-M 장시간 재검사 대기
 - SEC: 공식 재무·공시 읽기 전용
 - Telegram MTProto: 사용자가 선택한 방송 채널 읽기 전용
-- KIS 모의투자: 자격정보와 실제 모의계좌 왕복 검증 대기
+- KIS 모의투자·국내선물 시세: 어댑터 구현 완료, 자격정보와 실제 모의계좌·시세 왕복 검증 대기
 - NASDAQ 공식 실시간 지수, 일반 뉴스·커뮤니티 공식 API, 국내 선물 공식 상품 마스터: 공급자 또는 라이선스 결정 대기
+- 2026-08-27 공급자 결정: 국내 일반 뉴스는 네이버 뉴스 검색 API, 국내 공시·재무는 OpenDART, NASDAQ 공식 지수는 Nasdaq Data Link/GIDS를 1순위로 선정했다. Reddit·Stocktwits는 공식 개발자 승인 후 선택 연결하며 KIS는 현재 연결 범위에서 제외한다.
+- Claude Messages API와 Google Antigravity Interactions API의 분석 전용 REST 어댑터·Windows 자격 증명 저장·비용 발생 없는 설정 상태를 구현했다. 실제 API 키 왕복과 44인 직원 오케스트레이션 전환은 미완료다.
 
 ## 5. 절대 유지할 안전 경계
 
@@ -131,13 +144,15 @@ Google Cloud 프로젝트는 `investa-remote-bumniverse`, 리전은 서울 `asia
 - 최소 권한 `investa-relay` 서비스 계정
 - Telegram Bot token, webhook secret, desktop shared secret의 Secret Manager 저장
 - nonce TTL, Cloud Run 최소 0·최대 1, `liveOrderEnabled=false`
-- `investa-relay`, 진단용 `investa-relay-v2` 리비전 Ready
+- `investa-relay` 최신 리비전 `investa-relay-00003-v7h`, 진단용 `investa-relay-v2` 리비전 Ready
 - relay 로컬 `/healthz` 200과 보안 테스트
+- 현재 relay 소스의 Cloud Shell `node --test` 6개 통과
 
 차단 문제:
 
 - 두 공식 `run.app` URL이 컨테이너 도달 전에 Google 프런트엔드 HTTP 404를 반환한다.
 - ingress, 공개 액세스, 기본 HTTPS endpoint, traffic routing, 정책 거부 로그를 확인했지만 원인은 해소되지 않았다.
+- 2026-08-27 현재 소스 재배포와 traffic tag 제거·100% 최신 라우팅 재생성 후에도 404가 유지됐고, 최신 리비전에 `/healthz` 요청 로그가 생성되지 않았다.
 - 작동하지 않는 URL을 등록하면 Telegram 업데이트가 손실되므로 webhook은 의도적으로 등록하지 않았다.
 
 다음 순서:
@@ -161,11 +176,17 @@ C:\Users\Kim Beom soo\OneDrive\Documents\ProjectStudio
 Investa ProjectStudio 상태:
 
 - project ID: `36e87491-74a8-48ca-a7b8-30fa6ccea131`
-- PRD revision: `107`
-- 기능명세: 239개 (`done` 196, `in_progress` 38, `planned` 5)
-- 유저플로: 노드 107개, 엣지 92개
+- PRD revision: `162`
+- 기능명세: 279개 (`done` 222, `in_progress` 51, `planned` 6)
+- 자동매매·모델 고정 로드맵: `feat-auto-roadmap`과 하위 기능. 전략 승격·자동 배치·롤백, `PIT 데이터 매니페스트·ML worker 계약`, `LightGBM·XGBoost 기준 worker`, `OOS 원시 확률 Rust 재계산`, `PIT 데이터·라벨 빌더`, `XGBoost shard-aware 외부 메모리 worker`를 완료했다. `공식 실제시장 ML 기준 검증`은 730일·1h·4h·1d의 48개 모델과 fold별 과거 기준 레짐·비용·funding 스트레스를 마쳤지만 3~5년·분봉·주식·실계정 비용·호가 검증이 남아 `in_progress`이며, ML 모델 개발 상위 항목도 계속 진행 중이다.
+- 전략 판단·실행 주기 계약: `feat-auto-cadence-contract`, 완료 기준 4/4. 완료 봉 플러그인의 tick 판단과 interval 불일치를 거부하며 실주문은 잠겨 있다.
+- 뉴스·커뮤니티 어댑터 중복 노드를 `feat-official-news-community-adapters` 하나로 통합했다.
+- 유저플로: 노드 108개, 엣지 93개
 - 기술적 분석 차트 주석 기능: `feat-technical-chart-annotation-report`, 완료 기준 4/4
 - 연결 유저플로: `flow-analysis-vault-6`, 완료
+- 로그인 후 읽기 전용 전체 연결 자동 조회와 설정의 수동 재조회: `feat-automatic-connection-refresh`, 완료
+- Google·Apple 선택 로그인 보안 경계: `feat-security-social-login`, Google 실제 로그인 왕복 완료·통합 작업공간 소유자와 명시적 계정 연결 코드 완료·교차 계정 UI 왕복 및 Apple 공식 callback 준비 대기
+- Codex 분석 품질 프로필: `feat-codex-analysis-quality-profile`, 계정 지원 모델 검증·직원 high·본부장 xhigh·원본 근거 재대조·허위 evidence ID 차단 완료
 
 현재 상태를 읽기 전용으로 감사하는 명령:
 
@@ -179,8 +200,10 @@ python scripts/reconcile_projectstudio_status.py "C:\path\to\ProjectStudio"
 - `scripts/sync_projectstudio_chart_annotations.py`
 - `scripts/sync_projectstudio_reference_workstreams.py`
 - `scripts/sync_projectstudio_cycles_16_22.py`
+- `scripts/sync_projectstudio_security_hardening.py`
+- `scripts/sync_projectstudio_codex_analysis_quality.py`
 
-ProjectStudio의 SQLite DB나 자동 백업은 이 저장소에 복사하지 않는다. 최신 상세 감사 문서 중 `docs/projectstudio-status-audit-2026-08-25.md`는 revision 102 시점의 스냅샷이므로 위의 실제 revision 107 수치를 우선한다.
+ProjectStudio의 SQLite DB나 자동 백업은 이 저장소에 복사하지 않는다. 최신 상세 감사 문서 중 `docs/projectstudio-status-audit-2026-08-25.md`는 revision 102 시점의 스냅샷이다. 연결 설정은 실제 연결 성공·추가 확인 필요·미연결을 각각 체크·주황·회색으로 구분한다. `feat-cross-asset-chart-annotation-contracts`는 공식 증권선물 공급자 왕복만 남긴 `in_progress` 상태다. 공식 장 캘린더 조회·표시와 국장·미장 정규장 시장가 내부체결 gate를 구현했으며 장외에는 지정가 대기 주문만 허용한다.
 
 ## 8. 새 노트북 설정
 
@@ -216,21 +239,37 @@ pnpm tauri dev
 
 ## 9. 다음 우선 작업
 
+자동매매와 실제 ML 모델은 [자동매매·모델 개발 기준 로드맵](docs/automated-trading-roadmap.md)의 순서를 고정 기준으로 사용한다. 사용자가 이후 `다음 개발 단계`를 물으면 대화 중 다른 주제를 다뤘더라도 해당 문서의 미완료 첫 단계부터 이어간다. 2026-08-27 섀도우 감시를 React 타이머에서 Rust 백그라운드 worker로 이전하고 저장 실험의 `1m`·`1d` interval을 fresh bar 조회에 고정했다. 최초 연구 생성은 일봉이며 저장 보고서 재검증은 `1m`·`1d`를 선택한다. 이 상태는 틱 전략이나 앱 프로세스 밖 서버 운용 완료를 뜻하지 않는다.
+
 ### 즉시 가능
 
 1. 이 저장소를 새 노트북에서 clone한 뒤 전체 검증 재실행
 2. 기술적 분석가 보고의 불변 차트 캔들·선·박스 실제 UI 검수
-3. 코인·증권 선물·코인 선물 완료 봉을 공통 point-in-time snapshot 계약으로 정규화
-4. 해당 자산군에도 기술적 분석 차트 근거를 확장하고 데이터 누수 테스트 추가
-5. 24시간 shadow·Codex 회의·중단 복구 soak test를 실제 시간으로 수행
-6. ProjectStudio revision 107과 코드의 완료·진행·계획 상태를 다시 대사
+3. 코인·증권선물·코인 무기한선물 공식 공급자 snapshot을 구현된 공통 PIT 차트 계약에 연결
+4. 24시간 shadow·Codex 회의·중단 복구 soak test를 실제 시간으로 수행
+5. 중단 회의의 완료 부서 보고를 새 실행에 재사용하는 체크포인트 재개 정책 확정
+
+### 2026-08-27 완료
+
+- 코인 현물은 24시간·무거래 봉 누락, 증권선물은 계약코드·정산가·롤 경계, 코인 무기한선물은 마크·지수·펀딩 기준으로 선 규칙을 분리했다.
+- 완료·공개·수집 시각과 중복·겹침을 검사하는 공통 PIT 차트 계약 및 미래 데이터 누수 테스트를 추가했다.
+- 분석 보관함 JSON 왕복 뒤 차트 좌표·snapshot ID·근거 기준이 불변임을 검사한다.
+- 중단 회의 복구 바에 완료 보고 수와 남은 부서를 표시하고 입력·기존 보고 보존 상태를 설명한다.
+- 섀도우 내구 감사가 중복·메모리·타이머 외에 공급자 stale 관측과 재시작 대사 실패도 fail-closed로 잡는다.
+- ProjectStudio revision 108에 기능명세와 유저플로우 노드를 멱등 반영했다. 공식 공급자 왕복은 완료로 올리지 않았다.
+- Upbit 현물, Binance 현물·USDⓈ-M·COIN-M 공개 WebSocket 감독기를 추가하고 stale·재연결·순서 역행·24시간 이전 회전 경계를 구현했다.
+- 토스 공식 KR·US 장 캘린더를 정규화해 운영 준비 화면에 표시하고 저장된 자격정보로 실제 왕복을 검증했다.
+- ProjectStudio revision 121에서 Binance 개인계좌 읽기 전용 검증을 완료로 반영하고, 장 캘린더 조회와 주문 시간 gate를 분리해 과장된 완료 표시를 제거했다.
+- 국장·미장 시장가 즉시 모의체결은 주문 직전 공식 캘린더가 5분 이내이고 `regularMarket` 안일 때만 허용하며 휴장·장외·결측은 fail-closed로 차단한다.
+- 공개 스트림 실제 시간 내구 검사기를 추가했다. 25초 smoke에서 Upbit·Binance Spot·COIN-M은 통과했고 USDⓈ-M은 구독 연결 후 메시지 미수신으로 실패했다.
+- 토스 공식 AsyncAPI 기반 체결·호가 구독 선언과 Rust 인증 WebSocket 전송을 구현했다. `personal:order`는 SHADOW ONLY 경계에서 거부하며 공식 handshake·국장 구독 ack까지 실제 확인했다. 장중 KR/US 체결·호가와 24시간 왕복은 남아 있다.
 
 ### 계정·외부 결정 필요
 
 1. Cloud Run `run.app` 404에 대한 Google Cloud 지원 또는 다른 리전 진단 배포 결정
 2. Cloud endpoint 정상화 후 Telegram webhook·desktop poll 실제 왕복
 3. KIS 모의계좌 발급 후 잔고·주문·취소·체결·재시작 대사
-4. Toss 장시간 세션 만료·rate limit 복구, Upbit·Binance 개인계좌 읽기 전용 검증
+4. Toss 장중 KR/US 체결·호가·PING/pong과 장시간 세션 만료·rate limit 복구 검증
 5. NASDAQ·일반 뉴스·커뮤니티·국내 선물 공식 공급자와 라이선스 결정
 6. Chronos·TimesFM 등 외부 모델 worker와 가중치 도입 결정
 
@@ -238,7 +277,7 @@ pnpm tauri dev
 
 - 실전 주문과 출금
 - 자동 티스토리 게시
-- 일반 소비자 OAuth 로그인 서버
+- Apple ID HTTPS callback·서버측 토큰 검증과 Apple 앱 배포
 - 모델이 연결되지 않은 상태의 상승·하락 확률 생성
 
 ## 10. 검증 기준
@@ -253,7 +292,7 @@ cargo test --manifest-path src-tauri/Cargo.toml
 Push-Location server/relay; node --test; Pop-Location
 ```
 
-최근 기준 상태에서는 프론트 테스트 8개가 통과했고, TypeScript/Vite 빌드와 Rust format 검사가 통과했으며 Rust 테스트는 201개 통과·외부 계정 검증 4개 ignored였다. 새 노트북에서는 이 숫자를 신뢰해 생략하지 말고 다시 실행한다. relay 테스트도 새 환경에서 재실행한다.
+2026-08-30 기준 프론트 테스트 30개, TypeScript/Vite 빌드와 Rust format 검사가 통과했고 Rust 테스트는 321개 통과·외부 통합 검사 11개 ignored, Python ML worker 테스트는 13개, 실제시장 검증 runner 테스트는 13개, relay 테스트는 8개 통과했다. `internal-execution-v1`은 분할·재호가·명시적 부분체결·취소·만료·멱등성과 최대 2배 격리증거금·reduce-only·청산 완충 경계를 로컬 SQLite에서 검증하며 외부 주문 전송을 포함하지 않는다. 별도 외부 검사는 저장된 토스 자격정보로 시세·읽기 전용 계좌 DTO와 KR·US 장 캘린더를, 자격정보 없는 Upbit 현물과 Binance 현물·USDⓈ-M·COIN-M 공개 시세 및 분석 snapshot을 실제 응답으로 확인했다. Binance 공식 공개 BTC·ETH 현물·USDⓈ-M 730일 `1h`·`4h`·`1d`는 48개 expanding walk-forward XGBoost 모델과 fold별 과거 기준 6개 관측 레짐 검증을 통과했지만, 비용·funding을 적용한 비중첩 OOS 거래는 1배 비용부터 12개 조합 모두 순손실이라 전략 후보로 기각했다. 공개 WebSocket 체결을 1분봉·상위 주기로 집계하고 SQLite 체크포인트로 재시작 상태를 복원한다. 25초 실수신 재검사에서는 Upbit·Binance Spot·COIN-M 메시지를 수신했으나 USDⓈ-M은 제한 시간 내 메시지가 없어 재검증이 남았다. 이후 저장된 Upbit·Binance 자격정보로 개인계좌 읽기 전용 조회도 통과했다. KIS 국내선물은 이 PC에 모의 자격정보가 없어 계약 파서와 요청 경계까지만 검증했다. Claude·Antigravity 어댑터는 자격정보 형식·유료호출 확인·비밀문자열 차단·응답 정규화 테스트를 통과했으며 실제 API 키 왕복은 미검증이다. 새 노트북에서는 이 숫자를 신뢰해 생략하지 말고 다시 실행한다.
 
 ## 11. 작업 재개 시 보고 형식
 
@@ -264,6 +303,25 @@ Codex는 매 작업마다 다음을 분리해 기록한다.
 - 외부 계정 또는 운영 환경 검증 대기
 - 사용자 승인 필요
 - 장시간 검증 대기
+- 2026-08-31 공개 스트림 24시간 실제 시간 검사를 백그라운드로 시작했다. `%LOCALAPPDATA%\Investa\audits\market-stream-soak-24h-20260831.json`이 생성되기 전에는 통과로 올리지 않는다.
 - 의도적으로 잠금 유지
 
 기능명세의 `done`은 코드 경로와 수용 기준, 테스트 근거가 모두 있을 때만 사용한다. 기반만 있거나 외부 왕복이 남으면 `in_progress`, 공급자·계정·모델 결정 전이면 `planned`를 유지한다.
+# 2026-08-28 자동매매 주기 계약 진행
+
+- 퀀트 논문 연구원 패널에서 저장 보고서를 `1m` 또는 `1d`로 새 불변 실험 재검증할 수 있다.
+- 주식·코인 백테스트는 완료 봉만 사용하고 interval을 experiment·dataset ID와 저장 기록에 보존한다.
+- 새 실험에서 시작한 Rust 섀도우 감시는 저장된 동일 interval로 fresh bar를 조회한다.
+- `1m` 200봉은 약 3시간 20분의 짧은 탐색 구간이라 승격 근거로 사용할 수 없다는 경고를 표시한다.
+- 이 단계의 공통 집계 코어와 공개·토스 인증 WebSocket 입력은 연결했다. 다음 수용 기준은 장중 KR/US 체결·호가와 자산별 24시간 재연결·재시작 실제 검증이다.
+
+## 2026-08-28 Tick·완료 봉 집계 코어
+
+- `src-tauri/src/market_aggregation.rs`에 공급자 독립 공통 Tick 계약을 추가했다.
+- watermark 이전에 끝난 1분봉만 완료 처리하고 현재 분은 partial로 분리한다.
+- 3·5·15·30·60·240분 봉은 정렬된 완료 1분봉이 모두 있을 때만 생성한다.
+- 누락 분은 채우지 않고 gap으로 보존하며 중복·역순·원천 혼합·overflow를 fail-closed로 거부한다.
+- Upbit trade와 Binance Spot·USDⓈ-M·COIN-M aggregate trade를 집계 코어에 연결했다. 선물 mark/index/funding은 표시 전용으로 분리한다.
+- partial·최근 완료 1분봉·gap·마지막 순번을 SQLite에 체크포인트하고 앱 재시작 뒤 첫 체결에서 복원한다.
+- Upbit·Binance REST gap 복구와 토스 인증 WebSocket 전송은 구현했다. 토스 장중 KR/US 체결·호가 및 전체 스트림 장시간 실제 왕복 검증은 남아 있다.
+- 2026-08-28 변경된 체결 스트림 25초 실제 검사는 Upbit 31건, Binance Spot 25건, COIN-M 25건을 받았고 USDⓈ-M은 0건·stale 재연결 1회라 미검증으로 유지했다.

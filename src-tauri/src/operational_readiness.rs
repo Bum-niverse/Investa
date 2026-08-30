@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+};
 
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -343,11 +346,21 @@ pub fn paper_exit_reason_resolve(raw: Option<String>, legacy: bool) -> ExitReaso
 #[serde(rename_all = "camelCase")]
 pub struct SoakSample {
     pub observed_at_ms: u64,
+    #[serde(default)]
+    pub source_observed_at_ms: Option<u64>,
     pub memory_bytes: u64,
     pub timer_count: u32,
     pub sqlite_bytes: u64,
     pub candidate_key: Option<String>,
     pub provider_healthy: bool,
+    #[serde(default)]
+    pub restarted: bool,
+    #[serde(default = "default_true")]
+    pub reconciliation_passed: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -358,6 +371,14 @@ pub struct SoakAudit {
     pub memory_growth_bytes: i64,
     pub timer_growth: i32,
     pub sqlite_growth_bytes: i64,
+    #[serde(default)]
+    pub stale_sample_count: u32,
+    #[serde(default)]
+    pub restart_reconciliation_failure_count: u32,
+    #[serde(default)]
+    pub max_observation_gap_ms: u64,
+    #[serde(default)]
+    pub observation_gap_failure_count: u32,
     pub fail_closed: bool,
     pub warnings: Vec<String>,
 }
@@ -386,6 +407,36 @@ pub fn audit_soak(samples: &[SoakSample]) -> Result<SoakAudit, String> {
         }
     }
     let duration_ms = last.observed_at_ms.saturating_sub(first.observed_at_ms);
+    let stale_sample_count = samples
+        .iter()
+        .filter(|sample| {
+            sample
+                .source_observed_at_ms
+                .is_some_and(|source| sample.observed_at_ms.saturating_sub(source) > 300_000)
+        })
+        .count() as u32;
+    let restart_reconciliation_failure_count = samples
+        .iter()
+        .filter(|sample| sample.restarted && !sample.reconciliation_passed)
+        .count() as u32;
+    let max_observation_gap_ms = samples
+        .windows(2)
+        .map(|pair| {
+            pair[1]
+                .observed_at_ms
+                .saturating_sub(pair[0].observed_at_ms)
+        })
+        .max()
+        .unwrap_or_default();
+    let observation_gap_failure_count = samples
+        .windows(2)
+        .filter(|pair| {
+            pair[1]
+                .observed_at_ms
+                .saturating_sub(pair[0].observed_at_ms)
+                > 180_000
+        })
+        .count() as u32;
     let memory_growth_bytes = i128::from(last.memory_bytes) - i128::from(first.memory_bytes);
     let sqlite_growth_bytes = i128::from(last.sqlite_bytes) - i128::from(first.sqlite_bytes);
     let timer_growth = i64::from(last.timer_count) - i64::from(first.timer_count);
@@ -402,6 +453,12 @@ pub fn audit_soak(samples: &[SoakSample]) -> Result<SoakAudit, String> {
     if timer_growth > 4 {
         warnings.push("타이머 증가량이 기준을 초과했습니다.".to_owned());
     }
+    if stale_sample_count > 0 {
+        warnings.push("5분을 초과한 오래된 공급자 관측값이 감지됐습니다.".to_owned());
+    }
+    if restart_reconciliation_failure_count > 0 {
+        warnings.push("재시작 뒤 원장·후보 대사 실패가 감지됐습니다.".to_owned());
+    }
     Ok(SoakAudit {
         duration_ms,
         duplicate_candidate_count: duplicates,
@@ -410,9 +467,203 @@ pub fn audit_soak(samples: &[SoakSample]) -> Result<SoakAudit, String> {
         timer_growth: timer_growth.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
         sqlite_growth_bytes: sqlite_growth_bytes.clamp(i128::from(i64::MIN), i128::from(i64::MAX))
             as i64,
-        fail_closed: samples.iter().any(|sample| !sample.provider_healthy) || duplicates > 0,
+        stale_sample_count,
+        restart_reconciliation_failure_count,
+        max_observation_gap_ms,
+        observation_gap_failure_count,
+        fail_closed: samples.iter().any(|sample| !sample.provider_healthy)
+            || duplicates > 0
+            || stale_sample_count > 0
+            || restart_reconciliation_failure_count > 0,
         warnings,
     })
+}
+
+#[cfg(target_os = "windows")]
+fn process_working_set_bytes() -> Result<u64, String> {
+    use std::{ffi::c_void, mem};
+
+    #[allow(non_snake_case)]
+    #[repr(C)]
+    struct ProcessMemoryCounters {
+        cb: u32,
+        PageFaultCount: u32,
+        PeakWorkingSetSize: usize,
+        WorkingSetSize: usize,
+        QuotaPeakPagedPoolUsage: usize,
+        QuotaPagedPoolUsage: usize,
+        QuotaPeakNonPagedPoolUsage: usize,
+        QuotaNonPagedPoolUsage: usize,
+        PagefileUsage: usize,
+        PeakPagefileUsage: usize,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> *mut c_void;
+        fn K32GetProcessMemoryInfo(
+            process: *mut c_void,
+            counters: *mut ProcessMemoryCounters,
+            size: u32,
+        ) -> i32;
+    }
+
+    let mut counters: ProcessMemoryCounters = unsafe { mem::zeroed() };
+    counters.cb = u32::try_from(mem::size_of::<ProcessMemoryCounters>())
+        .map_err(|_| "프로세스 메모리 구조 크기를 변환하지 못했습니다.".to_owned())?;
+    let succeeded =
+        unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
+    if succeeded == 0 {
+        return Err("Windows 프로세스 working set을 읽지 못했습니다.".to_owned());
+    }
+    u64::try_from(counters.WorkingSetSize)
+        .map_err(|_| "프로세스 메모리 크기를 변환하지 못했습니다.".to_owned())
+}
+
+#[cfg(target_os = "macos")]
+fn process_working_set_bytes() -> Result<u64, String> {
+    use std::mem;
+
+    type MachPort = u32;
+    type KernReturn = i32;
+    type MachMsgTypeNumber = u32;
+
+    #[repr(C)]
+    struct TimeValue {
+        seconds: i32,
+        microseconds: i32,
+    }
+
+    #[repr(C)]
+    struct MachTaskBasicInfo {
+        virtual_size: u64,
+        resident_size: u64,
+        resident_size_max: u64,
+        user_time: TimeValue,
+        system_time: TimeValue,
+        policy: i32,
+        suspend_count: i32,
+    }
+
+    const KERN_SUCCESS: KernReturn = 0;
+    const MACH_TASK_BASIC_INFO: i32 = 20;
+
+    extern "C" {
+        static mach_task_self_: MachPort;
+        fn task_info(
+            target_task: MachPort,
+            flavor: i32,
+            task_info_out: *mut i32,
+            task_info_out_count: *mut MachMsgTypeNumber,
+        ) -> KernReturn;
+    }
+
+    let mut info: MachTaskBasicInfo = unsafe { mem::zeroed() };
+    let mut count =
+        MachMsgTypeNumber::try_from(mem::size_of::<MachTaskBasicInfo>() / mem::size_of::<i32>())
+            .map_err(|_| "macOS 프로세스 메모리 구조 크기를 변환하지 못했습니다.".to_owned())?;
+    let result = unsafe {
+        task_info(
+            mach_task_self_,
+            MACH_TASK_BASIC_INFO,
+            (&mut info as *mut MachTaskBasicInfo).cast::<i32>(),
+            &mut count,
+        )
+    };
+    if result != KERN_SUCCESS {
+        return Err(format!(
+            "macOS 프로세스 resident memory를 읽지 못했습니다: {result}"
+        ));
+    }
+    Ok(info.resident_size)
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn process_working_set_bytes() -> Result<u64, String> {
+    Err("현재 실제 메모리 내구 검사는 Windows와 macOS에서만 지원합니다.".to_owned())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SoakSampleRequest {
+    #[serde(default)]
+    pub restarted: bool,
+}
+
+fn collect_soak_sample(
+    request: SoakSampleRequest,
+    bridge: &PersistenceBridge,
+) -> Result<SoakSample, String> {
+    let observed_at_ms = now_ms()?;
+    let memory_bytes = process_working_set_bytes()?;
+    let sqlite_bytes = match bridge.database_path.as_ref() {
+        Some(path) => fs::metadata(path)
+            .map_err(|_| "SQLite 파일 크기를 읽지 못했습니다.".to_owned())?
+            .len(),
+        None => 0,
+    };
+    let connection = bridge
+        .connection
+        .lock()
+        .map_err(|_| "내구 검사 표본 저장소 잠금을 획득하지 못했습니다.".to_owned())?;
+    let timer_count = connection
+        .query_row(
+            "SELECT COUNT(*) FROM shadow_watches WHERE enabled=1",
+            [],
+            |row| row.get::<_, u32>(0),
+        )
+        .map_err(|error| format!("활성 섀도우 작업자 수를 읽지 못했습니다: {error}"))?;
+    let candidate_key = connection
+        .query_row(
+            "SELECT candidate_id FROM engine_order_candidates ORDER BY updated_at_ms DESC,candidate_id DESC LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("최근 내부 후보를 읽지 못했습니다: {error}"))?;
+    let source_observed_at_ms = connection
+        .query_row(
+            "SELECT MAX(observed_at_ms) FROM provider_health_events WHERE component_id IN ('sqlite','paper_ledger_krw','paper_ledger_usd')",
+            [],
+            |row| row.get::<_, Option<u64>>(0),
+        )
+        .map_err(|error| format!("공급자 관측 시각을 읽지 못했습니다: {error}"))?;
+    let unhealthy_count = connection
+        .query_row(
+            "SELECT COUNT(*) FROM provider_health_events p WHERE component_id IN ('sqlite','paper_ledger_krw','paper_ledger_usd') AND event_id=(SELECT event_id FROM provider_health_events WHERE component_id=p.component_id ORDER BY observed_at_ms DESC,event_id DESC LIMIT 1) AND (healthy=0 OR observed_at_ms<?1)",
+            params![observed_at_ms.saturating_sub(300_000)],
+            |row| row.get::<_, u32>(0),
+        )
+        .map_err(|error| format!("공급자 상태를 읽지 못했습니다: {error}"))?;
+    let provider_count = connection
+        .query_row("SELECT COUNT(DISTINCT component_id) FROM provider_health_events WHERE component_id IN ('sqlite','paper_ledger_krw','paper_ledger_usd')", [], |row| row.get::<_, u32>(0))
+        .map_err(|error| format!("공급자 상태 수를 읽지 못했습니다: {error}"))?;
+    let (reconciliation_status, mismatch_count): (String, u32) = connection
+        .query_row(
+            "SELECT status,mismatch_count FROM runtime_reconciliation_state WHERE id=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| format!("재시작 대사 상태를 읽지 못했습니다: {error}"))?;
+    Ok(SoakSample {
+        observed_at_ms,
+        source_observed_at_ms,
+        memory_bytes,
+        timer_count,
+        sqlite_bytes,
+        candidate_key,
+        provider_healthy: provider_count > 0 && unhealthy_count == 0,
+        restarted: request.restarted,
+        reconciliation_passed: reconciliation_status == "ready" && mismatch_count == 0,
+    })
+}
+
+#[tauri::command]
+pub fn shadow_soak_sample(
+    request: SoakSampleRequest,
+    bridge: State<'_, PersistenceBridge>,
+) -> Result<SoakSample, String> {
+    collect_soak_sample(request, bridge.inner())
 }
 
 #[tauri::command]
@@ -457,7 +708,13 @@ fn save_soak_audit(
     {
         return Err("내구 검사 실행 ID와 표본 수를 확인해 주세요.".to_owned());
     }
-    let audit = audit_soak(&request.samples)?;
+    let mut audit = audit_soak(&request.samples)?;
+    if !request.simulated_timeline && audit.observation_gap_failure_count > 0 {
+        audit.fail_closed = true;
+        audit
+            .warnings
+            .push("3분을 초과한 실제 내구 검사 표본 공백이 감지됐습니다.".to_owned());
+    }
     let created_at_ms = now_ms()?;
     let stored = StoredSoakAudit {
         run_id: request.run_id,
@@ -710,19 +967,25 @@ mod tests {
         let result = audit_soak(&[
             SoakSample {
                 observed_at_ms: 1,
+                source_observed_at_ms: Some(1),
                 memory_bytes: 10,
                 timer_count: 1,
                 sqlite_bytes: 10,
                 candidate_key: Some("bar-1".to_owned()),
                 provider_healthy: true,
+                restarted: false,
+                reconciliation_passed: true,
             },
             SoakSample {
                 observed_at_ms: 2,
+                source_observed_at_ms: Some(2),
                 memory_bytes: 20,
                 timer_count: 2,
                 sqlite_bytes: 20,
                 candidate_key: Some("bar-1".to_owned()),
                 provider_healthy: false,
+                restarted: false,
+                reconciliation_passed: true,
             },
         ])
         .expect("audit");
@@ -735,11 +998,14 @@ mod tests {
         let samples = (0..=24)
             .map(|hour| SoakSample {
                 observed_at_ms: 1 + hour * 3_600_000,
+                source_observed_at_ms: Some(1 + hour * 3_600_000),
                 memory_bytes: 100_000_000 + hour * 100_000,
                 timer_count: 4,
                 sqlite_bytes: 10_000_000 + hour * 1_000,
                 candidate_key: Some(format!("completed-bar-{hour}")),
                 provider_healthy: true,
+                restarted: hour == 12,
+                reconciliation_passed: true,
             })
             .collect::<Vec<_>>();
         let bridge = PersistenceBridge::in_memory().expect("database");
@@ -774,5 +1040,106 @@ mod tests {
             })
             .expect("count");
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn soak_audit_fails_closed_on_stale_data_and_restart_mismatch() {
+        let result = audit_soak(&[
+            SoakSample {
+                observed_at_ms: 1_000_000,
+                source_observed_at_ms: Some(1_000_000),
+                memory_bytes: 1,
+                timer_count: 1,
+                sqlite_bytes: 1,
+                candidate_key: None,
+                provider_healthy: true,
+                restarted: false,
+                reconciliation_passed: true,
+            },
+            SoakSample {
+                observed_at_ms: 1_400_001,
+                source_observed_at_ms: Some(1_000_000),
+                memory_bytes: 1,
+                timer_count: 1,
+                sqlite_bytes: 1,
+                candidate_key: None,
+                provider_healthy: true,
+                restarted: true,
+                reconciliation_passed: false,
+            },
+        ])
+        .expect("audit");
+        assert_eq!(result.stale_sample_count, 1);
+        assert_eq!(result.restart_reconciliation_failure_count, 1);
+        assert!(result.fail_closed);
+    }
+
+    #[test]
+    fn actual_soak_save_fails_closed_when_sampling_stops_for_over_three_minutes() {
+        let bridge = PersistenceBridge::in_memory().expect("database");
+        let stored = save_soak_audit(
+            SaveSoakAuditRequest {
+                run_id: "actual-gap".to_owned(),
+                samples: vec![
+                    SoakSample {
+                        observed_at_ms: 1,
+                        source_observed_at_ms: Some(1),
+                        memory_bytes: 1,
+                        timer_count: 1,
+                        sqlite_bytes: 1,
+                        candidate_key: None,
+                        provider_healthy: true,
+                        restarted: false,
+                        reconciliation_passed: true,
+                    },
+                    SoakSample {
+                        observed_at_ms: 240_002,
+                        source_observed_at_ms: Some(240_002),
+                        memory_bytes: 1,
+                        timer_count: 1,
+                        sqlite_bytes: 1,
+                        candidate_key: None,
+                        provider_healthy: true,
+                        restarted: true,
+                        reconciliation_passed: true,
+                    },
+                ],
+                simulated_timeline: false,
+            },
+            &bridge,
+        )
+        .expect("save actual gap");
+        assert_eq!(stored.audit.observation_gap_failure_count, 1);
+        assert!(stored.audit.fail_closed);
+        assert!(stored
+            .audit
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("표본 공백")));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn runtime_soak_sample_reads_real_process_and_local_health_without_secrets() {
+        let bridge = PersistenceBridge::in_memory().expect("database");
+        let observed_at_ms = now_ms().expect("now");
+        {
+            let connection = bridge.connection.lock().expect("connection");
+            for component in ["sqlite", "paper_ledger_krw", "paper_ledger_usd"] {
+                connection.execute(
+                    "INSERT INTO provider_health_events(event_id,component_id,critical,healthy,retry_action,detail,observed_at_ms) VALUES(?1,?2,1,1,'retry','ok',?3)",
+                    params![format!("health-{component}"), component, observed_at_ms],
+                ).expect("health event");
+            }
+        }
+        let sample = collect_soak_sample(SoakSampleRequest { restarted: true }, &bridge)
+            .expect("runtime sample");
+        assert!(sample.memory_bytes > 0);
+        assert_eq!(sample.sqlite_bytes, 0);
+        assert!(sample.provider_healthy);
+        assert!(sample.restarted && sample.reconciliation_passed);
+        let serialized = serde_json::to_string(&sample).expect("serialize");
+        assert!(!serialized.to_ascii_lowercase().contains("secret"));
+        assert!(!serialized.to_ascii_lowercase().contains("token"));
     }
 }

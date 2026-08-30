@@ -1,10 +1,14 @@
-import { type FormEvent, type KeyboardEvent, type ReactNode, useEffect, useRef, useState } from "react";
+import { type FormEvent, type KeyboardEvent, type ReactNode, useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { EMPTY_MARKET_INDEX_SNAPSHOT, type MarketIndexSnapshot } from "./marketIndices";
 import { KisPaperConnection, type PaperAccountSnapshot } from "./PaperTradingTerminal";
 import { INTEGRATION_CATALOG, supportLabel } from "./integrationCatalog";
 import { BinanceConnectionPanel, type BinanceAccountSnapshot, type BinanceConnectionStatus } from "./BinanceConnectionPanel";
-import { TelegramConnectionPanel } from "./TelegramConnectionPanel";
+import { TelegramConnectionPanel, type TelegramConnectionStatus } from "./TelegramConnectionPanel";
+import { AiProviderConnections, type CodexConnectionStatus } from "./AiProviderConnections";
+import { CONNECTION_LEGEND, connectionTone, type ConnectionTone } from "./connectionStatus";
+import { summarizeConnectionRefresh, type ConnectionProbeResult, type ConnectionRefreshSummary } from "./connectionRefresh";
+import { SocialLoginSettings } from "./SocialLoginSettings";
 
 type TossConnectionStatus = {
   configured: boolean;
@@ -17,19 +21,15 @@ type TossConnectionResult = {
   snapshot: MarketIndexSnapshot;
 };
 
-type CodexConnectionStatus = {
-  available: boolean;
-  connected: boolean;
-  loggedIn: boolean;
-  version?: string | null;
-  authMode?: string | null;
-  message: string;
-};
-
 type KisConnectionStatus = {
   configured: boolean;
   connected: boolean;
   message: string;
+};
+
+type KisFuturesConnectionStatus = KisConnectionStatus & {
+  provider: string;
+  marketDataReady: boolean;
 };
 
 type UpbitConnectionStatus = {
@@ -48,6 +48,7 @@ type UpbitAccountSnapshot = {
   provider: string;
   fetchedAtMs: number;
   readOnly: boolean;
+  permissionVerified: boolean;
   accounts: Array<{ currency: string; balance: string; locked: string; avg_buy_price: string; unit_currency: string }>;
 };
 
@@ -77,15 +78,34 @@ type TossSettingsDialogProps = {
   onPaperAccount: (snapshot: PaperAccountSnapshot) => void;
 };
 
-function SettingsFold({ eyebrow, title, status, defaultOpen = false, children }: {
+type AiProviderStatus = {
+  provider: string;
+  label: string;
+  configured: boolean;
+  connected: boolean;
+};
+
+type SafeInvokeResult<T> = { ok: true; value: T } | { ok: false };
+
+const safeInvoke = async <T,>(command: string): Promise<SafeInvokeResult<T>> => {
+  try {
+    return { ok: true, value: await invoke<T>(command) };
+  } catch {
+    return { ok: false };
+  }
+};
+
+function SettingsFold({ eyebrow, title, status, statusTone = "neutral", defaultOpen = false, children }: {
   eyebrow: string;
   title: string;
   status?: string;
+  statusTone?: ConnectionTone;
   defaultOpen?: boolean;
   children: ReactNode;
 }) {
-  return <details className="settings-fold" open={defaultOpen}>
+  return <details className={`settings-fold is-${statusTone}`} open={defaultOpen}>
     <summary>
+      <i className="settings-fold-status" aria-hidden="true" />
       <div><span>{eyebrow}</span><strong>{title}</strong></div>
       <small>{status}</small>
     </summary>
@@ -152,6 +172,7 @@ export function TossSettingsDialog({ open, onClose, onSnapshot, onPaperAccount }
   const [paperAccount, setPaperAccount] = useState<PaperAccountSnapshot | null>(null);
   const [codexStatus, setCodexStatus] = useState<CodexConnectionStatus | null>(null);
   const [kisStatus, setKisStatus] = useState<KisConnectionStatus | null>(null);
+  const [kisFuturesStatus, setKisFuturesStatus] = useState<KisFuturesConnectionStatus | null>(null);
   const [upbitStatus, setUpbitStatus] = useState<UpbitConnectionStatus>({ configured: false, connected: false, message: "상태 확인 중" });
   const [secStatus, setSecStatus] = useState<SecConnectionStatus>({ configured: false, connected: false, message: "상태 확인 중" });
   const [secContact, setSecContact] = useState("");
@@ -164,10 +185,175 @@ export function TossSettingsDialog({ open, onClose, onSnapshot, onPaperAccount }
   const [upbitError, setUpbitError] = useState<string | null>(null);
   const [binanceStatus, setBinanceStatus] = useState<BinanceConnectionStatus>({ configured: false, connected: false, message: "상태 확인 중" });
   const [binanceSnapshot, setBinanceSnapshot] = useState<BinanceAccountSnapshot | null>(null);
+  const [telegramStatus, setTelegramStatus] = useState<TelegramConnectionStatus>({ configured: false, sessionStored: false, authorized: false, selectedChannelCount: 0, message: "상태 확인 중" });
   const [accountBusy, setAccountBusy] = useState(false);
+  const [connectionRefreshBusy, setConnectionRefreshBusy] = useState(false);
+  const [connectionRefreshSummary, setConnectionRefreshSummary] = useState<ConnectionRefreshSummary | null>(null);
+  const [connectionRefreshSource, setConnectionRefreshSource] = useState<"automatic" | "manual" | null>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const clientIdRef = useRef<HTMLInputElement>(null);
+  const mountedRef = useRef(true);
+  const connectionRefreshBusyRef = useRef(false);
+  const automaticRefreshStartedRef = useRef(false);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
+
+  const refreshAllConnections = useCallback(async (source: "automatic" | "manual") => {
+    if (connectionRefreshBusyRef.current) return;
+    if (!isTauriRuntime) {
+      setConnectionRefreshSource(source);
+      setConnectionRefreshSummary(summarizeConnectionRefresh([
+        { id: "desktop", label: "Investa 데스크톱", state: "failed" },
+      ], Date.now()));
+      return;
+    }
+
+    connectionRefreshBusyRef.current = true;
+    setConnectionRefreshBusy(true);
+    setConnectionRefreshSource(source);
+
+    const [toss, codex, kis, kisFutures, upbit, sec, binance, telegram, paper, aiProviders] = await Promise.all([
+      safeInvoke<TossConnectionStatus>("toss_connection_status"),
+      safeInvoke<CodexConnectionStatus>("codex_status"),
+      safeInvoke<KisConnectionStatus>("kis_paper_config_status"),
+      safeInvoke<KisFuturesConnectionStatus>("kis_futures_connection_status"),
+      safeInvoke<UpbitConnectionStatus>("upbit_connection_status"),
+      safeInvoke<SecConnectionStatus>("sec_connection_status"),
+      safeInvoke<BinanceConnectionStatus>("binance_connection_status"),
+      safeInvoke<TelegramConnectionStatus>("telegram_connection_status"),
+      safeInvoke<PaperAccountSnapshot>("paper_account_status"),
+      safeInvoke<AiProviderStatus[]>("ai_provider_statuses"),
+    ]);
+
+    if (mountedRef.current) {
+      if (toss.ok) setStatus(toss.value);
+      if (codex.ok) setCodexStatus(codex.value);
+      if (kis.ok) setKisStatus(kis.value);
+      if (kisFutures.ok) setKisFuturesStatus(kisFutures.value);
+      if (upbit.ok) setUpbitStatus(upbit.value);
+      if (sec.ok) setSecStatus(sec.value);
+      if (binance.ok) setBinanceStatus(binance.value);
+      if (telegram.ok) setTelegramStatus(telegram.value);
+      if (paper.ok) {
+        setPaperAccount(paper.value);
+        onPaperAccount(paper.value);
+      }
+    }
+
+    const probes: Array<Promise<ConnectionProbeResult>> = [];
+
+    if (!toss.ok) {
+      probes.push(Promise.resolve({ id: "toss", label: "토스증권", state: "failed" }));
+    } else if (!toss.value.configured) {
+      probes.push(Promise.resolve({ id: "toss", label: "토스증권", state: "disconnected" }));
+    } else {
+      probes.push((async () => {
+        const [market, account] = await Promise.all([
+          safeInvoke<MarketIndexSnapshot>("market_indices_snapshot"),
+          safeInvoke<TossAccountSnapshot>("toss_account_snapshot"),
+        ]);
+        if (mountedRef.current) {
+          if (market.ok) onSnapshot(market.value);
+          if (account.ok) setAccountSnapshot(account.value);
+          setStatus({
+            configured: true,
+            connected: account.ok,
+            message: account.ok ? "읽기 전용 시세·계좌 조회를 확인했습니다." : "자격정보는 저장됐지만 계좌 조회를 확인하지 못했습니다.",
+          });
+        }
+        return { id: "toss", label: "토스증권", state: account.ok ? "connected" : "attention" };
+      })());
+    }
+
+    if (!upbit.ok) {
+      probes.push(Promise.resolve({ id: "upbit", label: "Upbit", state: "failed" }));
+    } else if (!upbit.value.configured) {
+      probes.push(Promise.resolve({ id: "upbit", label: "Upbit", state: "disconnected" }));
+    } else {
+      probes.push((async () => {
+        const account = await safeInvoke<UpbitAccountSnapshot>("upbit_account_snapshot");
+        if (mountedRef.current) {
+          setUpbitSnapshot(account.ok ? account.value : null);
+          setUpbitStatus({ configured: true, connected: account.ok, message: account.ok ? "계좌 조회 성공 · Upbit 관리 화면에서 주문·출금 권한 비활성화 확인 필요" : "키는 저장됐지만 계좌 조회를 확인하지 못했습니다." });
+        }
+        return { id: "upbit", label: "Upbit", state: account.ok && account.value.permissionVerified ? "connected" : "attention" };
+      })());
+    }
+
+    if (!binance.ok) {
+      probes.push(Promise.resolve({ id: "binance", label: "Binance", state: "failed" }));
+    } else if (!binance.value.configured) {
+      probes.push(Promise.resolve({ id: "binance", label: "Binance", state: "disconnected" }));
+    } else {
+      probes.push((async () => {
+        const account = await safeInvoke<BinanceAccountSnapshot>("binance_account_snapshot");
+        const connected = account.ok && (account.value.spot.connected || account.value.usdM.connected || account.value.coinM.connected);
+        if (mountedRef.current) {
+          setBinanceSnapshot(account.ok ? account.value : null);
+          setBinanceStatus({ configured: true, connected, message: connected ? "상품별 읽기 전용 계좌 연결을 확인했습니다." : "키는 저장됐지만 활성 계좌 조회를 확인하지 못했습니다." });
+        }
+        return { id: "binance", label: "Binance", state: connected ? "connected" : "attention" };
+      })());
+    }
+
+    if (!kis.ok) {
+      probes.push(Promise.resolve({ id: "kis", label: "KIS 모의투자", state: "failed" }));
+    } else if (!kis.value.configured) {
+      probes.push(Promise.resolve({ id: "kis", label: "KIS 모의투자", state: "disconnected" }));
+    } else {
+      probes.push((async () => {
+        const account = await safeInvoke<unknown>("kis_paper_account_snapshot");
+        if (mountedRef.current) setKisStatus({ configured: true, connected: account.ok, message: account.ok ? "KIS 모의계좌 조회를 확인했습니다." : "정보는 저장됐지만 모의계좌 조회를 확인하지 못했습니다." });
+        return { id: "kis", label: "KIS 모의투자", state: account.ok ? "connected" : "attention" };
+      })());
+    }
+
+    if (!sec.ok) {
+      probes.push(Promise.resolve({ id: "sec", label: "SEC", state: "failed" }));
+    } else if (!sec.value.configured) {
+      probes.push(Promise.resolve({ id: "sec", label: "SEC", state: "disconnected" }));
+    } else {
+      probes.push((async () => {
+        const result = await safeInvoke<SecConnectionStatus>("sec_connection_probe");
+        if (mountedRef.current) setSecStatus(result.ok ? result.value : { configured: true, connected: false, message: "연락처는 저장됐지만 SEC 응답을 확인하지 못했습니다." });
+        return { id: "sec", label: "SEC", state: result.ok ? "connected" : "attention" };
+      })());
+    }
+
+    probes.push(Promise.resolve(!telegram.ok
+      ? { id: "telegram", label: "Telegram", state: "failed" }
+      : { id: "telegram", label: "Telegram", state: telegram.value.authorized ? "connected" : telegram.value.configured ? "attention" : "disconnected" }));
+    probes.push(Promise.resolve(!codex.ok
+      ? { id: "codex", label: "Codex", state: "failed" }
+      : { id: "codex", label: "Codex", state: codex.value.connected ? "connected" : codex.value.available ? "attention" : "disconnected" }));
+
+    if (!aiProviders.ok) {
+      probes.push(Promise.resolve({ id: "external-ai", label: "외부 AI", state: "failed" }));
+    } else {
+      for (const provider of aiProviders.value) {
+        probes.push(Promise.resolve({
+          id: provider.provider,
+          label: provider.label,
+          state: provider.connected ? "connected" : provider.configured ? "attention" : "disconnected",
+        }));
+      }
+    }
+
+    const results = await Promise.all(probes);
+    if (mountedRef.current) setConnectionRefreshSummary(summarizeConnectionRefresh(results, Date.now()));
+    connectionRefreshBusyRef.current = false;
+    if (mountedRef.current) setConnectionRefreshBusy(false);
+  }, [onPaperAccount, onSnapshot]);
+
+  useEffect(() => {
+    if (automaticRefreshStartedRef.current) return;
+    automaticRefreshStartedRef.current = true;
+    void refreshAllConnections("automatic");
+  }, [refreshAllConnections]);
 
   useEffect(() => {
     if (!open) {
@@ -183,7 +369,6 @@ export function TossSettingsDialog({ open, onClose, onSnapshot, onPaperAccount }
       setSecError(null);
       return;
     }
-    let disposed = false;
     setError(null);
     setConfirmingDelete(false);
     if (!isTauriRuntime) {
@@ -194,33 +379,11 @@ export function TossSettingsDialog({ open, onClose, onSnapshot, onPaperAccount }
       }, 0);
       return;
     }
-    void invoke<TossConnectionStatus>("toss_connection_status")
-      .then((nextStatus) => { if (!disposed) setStatus(nextStatus); })
-      .catch((reason) => { if (!disposed) setError(String(reason)); });
-    void invoke<CodexConnectionStatus>("codex_status")
-      .then((nextStatus) => { if (!disposed) setCodexStatus(nextStatus); })
-      .catch(() => { if (!disposed) setCodexStatus({ available: false, connected: false, loggedIn: false, message: "Codex CLI 또는 로그인을 확인해 주세요." }); });
-    void invoke<KisConnectionStatus>("kis_paper_config_status")
-      .then((nextStatus) => { if (!disposed) setKisStatus(nextStatus); })
-      .catch(() => { if (!disposed) setKisStatus({ configured: false, connected: false, message: "KIS 모의 어댑터 상태를 확인하지 못했습니다." }); });
-    void invoke<UpbitConnectionStatus>("upbit_connection_status")
-      .then((nextStatus) => { if (!disposed) setUpbitStatus(nextStatus); })
-      .catch(() => { if (!disposed) setUpbitStatus({ configured: false, connected: false, message: "Upbit 연결 상태를 확인하지 못했습니다." }); });
-    void invoke<SecConnectionStatus>("sec_connection_status")
-      .then((nextStatus) => { if (!disposed) setSecStatus(nextStatus); })
-      .catch(() => { if (!disposed) setSecStatus({ configured: false, connected: false, message: "SEC 재무 연결 상태를 확인하지 못했습니다." }); });
-    void invoke<BinanceConnectionStatus>("binance_connection_status")
-      .then((nextStatus) => { if (!disposed) setBinanceStatus(nextStatus); })
-      .catch(() => { if (!disposed) setBinanceStatus({ configured: false, connected: false, message: "Binance 연결 상태를 확인하지 못했습니다." }); });
-    void invoke<PaperAccountSnapshot>("paper_account_status")
-      .then((snapshot) => { if (!disposed) { setPaperAccount(snapshot); onPaperAccount(snapshot); } })
-      .catch(() => { if (!disposed) setPaperAccount(null); });
     window.setTimeout(() => {
       dialogRef.current?.scrollTo({ top: 0 });
       closeButtonRef.current?.focus();
     }, 0);
-    return () => { disposed = true; };
-  }, [open, onPaperAccount]);
+  }, [open]);
 
   if (!open) return null;
 
@@ -331,7 +494,7 @@ export function TossSettingsDialog({ open, onClose, onSnapshot, onPaperAccount }
     try {
       const snapshot = await invoke<UpbitAccountSnapshot>("upbit_account_snapshot");
       setUpbitSnapshot(snapshot);
-      setUpbitStatus({ configured: true, connected: true, message: "읽기 전용 개인계좌 연결을 확인했습니다." });
+      setUpbitStatus({ configured: true, connected: true, message: "계좌 조회 성공 · Upbit 관리 화면에서 주문·출금 권한 비활성화 확인 필요" });
     } catch (reason) {
       setUpbitSnapshot(null);
       setUpbitStatus((current) => ({ ...current, connected: false }));
@@ -406,17 +569,37 @@ export function TossSettingsDialog({ open, onClose, onSnapshot, onPaperAccount }
         <SettingsFold eyebrow="CONNECTION STATUS" title="시장·계좌 연결 상태" status="실전 주문 전체 잠금" defaultOpen>
         <section className="settings-integration-overview" aria-labelledby="integration-overview-title">
           <header><div><span>CONNECTION STATUS</span><h3 id="integration-overview-title">시장·계좌 연결 상태</h3></div><small>실전 주문은 전체 잠금</small></header>
+          <div className="settings-connection-refresh">
+            <div>
+              <strong>{connectionRefreshBusy ? "전체 연결을 조회하고 있습니다." : connectionRefreshSummary ? `${connectionRefreshSummary.total}개 공급자 조회 완료` : "로그인 후 자동으로 연결을 조회합니다."}</strong>
+              <span role="status" aria-live="polite">
+                {connectionRefreshBusy
+                  ? "저장된 자격정보로 읽기 전용 상태만 확인합니다. 주문·출금·유료 AI 분석은 실행하지 않습니다."
+                  : connectionRefreshSummary
+                    ? `연결 ${connectionRefreshSummary.connected} · 확인 필요 ${connectionRefreshSummary.attention} · 미연결 ${connectionRefreshSummary.disconnected} · 실패 ${connectionRefreshSummary.failed} · ${new Date(connectionRefreshSummary.completedAtMs).toLocaleString("ko-KR")} ${connectionRefreshSource === "automatic" ? "자동 조회" : "수동 조회"}`
+                    : "설정을 열지 않아도 로그인 직후 한 번 확인합니다."}
+              </span>
+            </div>
+            <button type="button" onClick={() => void refreshAllConnections("manual")} disabled={connectionRefreshBusy}>
+              {connectionRefreshBusy ? "전체 연결 조회 중…" : "전체 연결 조회"}
+            </button>
+          </div>
           <div className="settings-integration-grid">
-            <article className={status.connected ? "is-connected" : "is-empty"}><i aria-hidden="true" /><div><strong>국장</strong><span>{status.connected ? "토스 시세·계좌 조회 지원" : status.configured ? "토스 저장됨 · 계좌 확인 필요" : "시세·계좌 미연결"}</span></div><b>{kisStatus?.connected ? "KIS 모의 연결" : kisStatus?.configured ? "KIS 저장됨" : "KIS 미연결"}</b></article>
-            <article className={status.connected || secStatus.configured ? "is-connected" : "is-empty"}><i aria-hidden="true" /><div><strong>미장</strong><span>{status.connected ? `토스 시세${secStatus.configured ? " · SEC 재무" : ""}` : secStatus.configured ? "SEC 재무 · 시세 미연결" : "시세·재무 미연결"}</span></div><b>주문 어댑터 필요</b></article>
-            <article className={upbitStatus.connected ? "is-connected" : "is-partial"}><i aria-hidden="true" /><div><strong>코인</strong><span>Upbit 공개 시세 사용 가능</span></div><b>{upbitStatus.connected ? "개인 계좌 연결" : upbitStatus.configured ? "키 저장됨 · 확인 필요" : "개인 계좌 미연결"}</b></article>
-            <article className="is-local"><i aria-hidden="true" /><div><strong>증권 선물</strong><span>내부 sandbox 사용 가능</span></div><b>증권사 계좌 미연결</b></article>
-            <article className={binanceSnapshot?.usdM.connected || binanceSnapshot?.coinM.connected ? "is-connected" : "is-partial"}><i aria-hidden="true" /><div><strong>코인 선물</strong><span>Binance USDⓈ-M·COIN-M</span></div><b>{binanceSnapshot?.usdM.connected || binanceSnapshot?.coinM.connected ? "읽기 전용 연결" : binanceStatus.configured ? "키 저장됨 · 확인 필요" : "개인 계좌 미연결"}</b></article>
+            <article className={`is-${connectionTone(status.connected, status.configured)}`}><i aria-hidden="true" /><div><strong>국장</strong><span>{status.connected ? "토스 시세·계좌 조회 지원" : status.configured ? "토스 저장됨 · 계좌 확인 필요" : "시세·계좌 미연결"}</span></div><b>{kisStatus?.connected ? "KIS 모의 연결" : kisStatus?.configured ? "KIS 저장됨" : "KIS 미연결"}</b></article>
+            <article className={`is-${connectionTone(status.connected, status.configured || secStatus.configured)}`}><i aria-hidden="true" /><div><strong>미장</strong><span>{status.connected ? `토스 시세${secStatus.connected ? " · SEC 재무" : ""}` : secStatus.configured ? "SEC 정보 저장 · 시세 확인 필요" : "시세·재무 미연결"}</span></div><b>주문 어댑터 필요</b></article>
+            <article className={`is-${connectionTone(upbitStatus.connected && Boolean(upbitSnapshot?.permissionVerified), upbitStatus.configured)}`}><i aria-hidden="true" /><div><strong>코인</strong><span>Upbit 공개 시세 사용 가능</span></div><b>{upbitStatus.connected ? "계좌 조회 · 권한 확인 필요" : upbitStatus.configured ? "키 저장됨 · 확인 필요" : "개인 계좌 미연결"}</b></article>
+            <article className={`is-${connectionTone(Boolean(kisFuturesStatus?.marketDataReady), Boolean(kisFuturesStatus?.configured))}`}><i aria-hidden="true" /><div><strong>증권 선물</strong><span>{kisFuturesStatus?.marketDataReady ? "KIS 공식 국내선물 일봉 준비" : "내부 sandbox 사용 가능"}</span></div><b>{kisFuturesStatus?.marketDataReady ? "읽기 전용 준비" : kisFuturesStatus?.configured ? "정보 저장 · 확인 필요" : "KIS 미연결"}</b></article>
+            <article className={`is-${connectionTone(Boolean(binanceSnapshot?.usdM.connected || binanceSnapshot?.coinM.connected), binanceStatus.configured)}`}><i aria-hidden="true" /><div><strong>코인 선물</strong><span>Binance USDⓈ-M·COIN-M</span></div><b>{binanceSnapshot?.usdM.connected || binanceSnapshot?.coinM.connected ? "읽기 전용 연결" : binanceStatus.configured ? "키 저장됨 · 확인 필요" : "개인 계좌 미연결"}</b></article>
+            <article className={secStatus.connected ? "is-connected" : secStatus.configured ? "is-partial" : "is-empty"}><i aria-hidden="true" /><div><strong>SEC 공시·재무</strong><span>미국 공식 Company Facts·Submissions</span></div><b>{secStatus.connected ? "연결 완료" : secStatus.configured ? "연락처 저장됨" : "미연결"}</b></article>
+            <article className={telegramStatus.authorized ? "is-connected" : telegramStatus.configured ? "is-partial" : "is-empty"}><i aria-hidden="true" /><div><strong>Telegram 뉴스</strong><span>{telegramStatus.authorized ? `읽기 전용 세션 · 선택 채널 ${telegramStatus.selectedChannelCount}개` : "선택 방송 채널 수집"}</span></div><b>{telegramStatus.authorized ? "연결 완료" : telegramStatus.configured ? "로그인 확인 필요" : "미연결"}</b></article>
+          </div>
+          <div className="settings-status-legend" aria-label="연결 상태 색상 안내">
+            {CONNECTION_LEGEND.map((item) => <span className={`is-${item.tone}`} key={item.tone}><i aria-hidden="true" /><strong>{item.label}</strong><small>{item.description}</small></span>)}
           </div>
         </section>
         </SettingsFold>
 
-        <SettingsFold eyebrow="SEC · OFFICIAL FUNDAMENTALS" title="미장 공식 재무 연결" status={secStatus.connected ? "연결됨" : secStatus.configured ? "저장됨" : "미연결"}>
+        <SettingsFold eyebrow="SEC · OFFICIAL FUNDAMENTALS" title="미장 공식 재무 연결" status={secStatus.connected ? "연결됨" : secStatus.configured ? "저장됨" : "미연결"} statusTone={connectionTone(secStatus.connected, secStatus.configured)}>
         <section className="settings-provider-connect" aria-labelledby="sec-connect-title">
           <header><div><span>SEC · OFFICIAL FUNDAMENTALS</span><h3 id="sec-connect-title">미장 공식 재무 연결</h3></div><b>{secStatus.connected ? "연결됨" : secStatus.configured ? "저장됨" : "미연결"}</b></header>
           <p>{secStatus.message} API 키는 없지만 SEC 정책에 따라 요청 User-Agent에 연락 이메일을 포함합니다. 이메일은 Windows 자격 증명 관리자에만 저장됩니다.</p>
@@ -431,8 +614,8 @@ export function TossSettingsDialog({ open, onClose, onSnapshot, onPaperAccount }
         </section>
         </SettingsFold>
 
-        <SettingsFold eyebrow="TELEGRAM · READ ONLY" title="투자 뉴스 채널 수집" status="선택 채널만 수집">
-        <TelegramConnectionPanel open={open} />
+        <SettingsFold eyebrow="TELEGRAM · READ ONLY" title="투자 뉴스 채널 수집" status={telegramStatus.authorized ? `연결됨 · ${telegramStatus.selectedChannelCount}개 채널` : telegramStatus.configured ? "로그인 확인 필요" : "미연결"} statusTone={connectionTone(telegramStatus.authorized, telegramStatus.configured)}>
+        <TelegramConnectionPanel open={open} onStatusChange={setTelegramStatus} />
         </SettingsFold>
 
         <div className={`settings-status ${statusClass}`} role="status">
@@ -452,7 +635,7 @@ export function TossSettingsDialog({ open, onClose, onSnapshot, onPaperAccount }
         </section>
         </SettingsFold>
 
-        <SettingsFold eyebrow="UPBIT · READ ONLY" title="코인 개인계좌 연결" status={upbitStatus.connected ? "연결됨" : upbitStatus.configured ? "저장됨" : "미연결"}>
+        <SettingsFold eyebrow="UPBIT · READ ONLY" title="코인 개인계좌 연결" status={upbitStatus.connected ? "연결됨" : upbitStatus.configured ? "저장됨" : "미연결"} statusTone={connectionTone(upbitStatus.connected, upbitStatus.configured)}>
         <section className="settings-provider-connect" aria-labelledby="upbit-connect-title">
           <header><div><span>UPBIT · READ ONLY</span><h3 id="upbit-connect-title">코인 개인계좌 연결</h3></div><b>{upbitStatus.connected ? "연결됨" : upbitStatus.configured ? "저장됨" : "미연결"}</b></header>
           <p>{upbitStatus.message} 조회 권한만 허용한 API 키를 사용하고 주문·출금 권한은 부여하지 마세요.</p>
@@ -469,21 +652,22 @@ export function TossSettingsDialog({ open, onClose, onSnapshot, onPaperAccount }
             {upbitStatus.configured && <button className="settings-danger" type="button" onClick={() => void handleUpbitDelete()} disabled={upbitBusy}>Upbit 연결 삭제</button>}
           </div>
           {upbitSnapshot && <div className="settings-coin-balances" role="status">
-            <small>{new Date(upbitSnapshot.fetchedAtMs).toLocaleString("ko-KR")} · 읽기 전용</small>
+            <small>{new Date(upbitSnapshot.fetchedAtMs).toLocaleString("ko-KR")} · 계좌 조회 성공 · 주문·출금 권한 미검증</small>
             {upbitSnapshot.accounts.length === 0 ? <p>보유 잔고가 없습니다.</p> : upbitSnapshot.accounts.map((account) => <article key={account.currency}><strong>{account.currency}</strong><span>사용 가능 {formatDecimalAmount(account.balance)}</span><span>주문 잠김 {formatDecimalAmount(account.locked)}</span></article>)}
           </div>}
         </section>
         </SettingsFold>
 
-        <SettingsFold eyebrow="BINANCE · READ ONLY" title="현물·코인 선물 계좌 연결" status={binanceStatus.connected ? "연결됨" : binanceStatus.configured ? "저장됨" : "미연결"}>
-        <BinanceConnectionPanel status={binanceStatus} onStatusChange={(nextStatus, snapshot) => { setBinanceStatus(nextStatus); if (snapshot !== undefined) setBinanceSnapshot(snapshot); }} />
+        <SettingsFold eyebrow="BINANCE · READ ONLY" title="현물·코인 선물 계좌 연결" status={binanceStatus.connected ? "연결됨" : binanceStatus.configured ? "저장됨" : "미연결"} statusTone={connectionTone(binanceStatus.connected, binanceStatus.configured)}>
+        <BinanceConnectionPanel status={binanceStatus} refreshedSnapshot={binanceSnapshot} onStatusChange={(nextStatus, snapshot) => { setBinanceStatus(nextStatus); if (snapshot !== undefined) setBinanceSnapshot(snapshot); }} />
         </SettingsFold>
 
-        <SettingsFold eyebrow="KIS VIRTUAL TRADING" title="KIS 모의계좌 연결" status={kisStatus?.connected ? "연결됨" : kisStatus?.configured ? "저장됨" : "미연결"}>
+        <SettingsFold eyebrow="KIS VIRTUAL TRADING" title="KIS 모의계좌 연결" status={kisStatus?.connected ? "연결됨" : kisStatus?.configured ? "저장됨" : "미연결"} statusTone={connectionTone(Boolean(kisStatus?.connected), Boolean(kisStatus?.configured))}>
+        <p className="settings-provider-note">{kisFuturesStatus?.message ?? "KIS 증권선물 읽기 전용 시세 상태를 확인하고 있습니다."} 현재 만기 계약코드를 직접 지정하며 근월물·정산가를 추정하지 않습니다.</p>
         <KisPaperConnection />
         </SettingsFold>
 
-        <SettingsFold eyebrow="KR STOCK · READ ONLY" title="국장 계좌·내부 모의원장" status={status.connected ? "연결됨" : status.configured ? "저장됨" : "미연결"}>
+        <SettingsFold eyebrow="KR STOCK · READ ONLY" title="국장 계좌·내부 모의원장" status={status.connected ? "연결됨" : status.configured ? "저장됨" : "미연결"} statusTone={connectionTone(status.connected, status.configured)}>
         <section className="settings-account" aria-labelledby="settings-account-title">
           <header><div><span>KR STOCK · READ ONLY</span><h3 id="settings-account-title">국장 토스증권 계좌·내부 모의원장</h3></div><button className="settings-balance-button" type="button" onClick={() => void handleAccountSync()} disabled={!status.configured || accountBusy}>{accountBusy ? "국장 계좌 조회 중…" : "국장 계좌 잔고 조회"}</button></header>
           <div className="settings-paper-status"><span>내부 모의계좌</span><strong>{paperAccount ? `₩${paperAccount.account.cashMinor.toLocaleString("ko-KR")}` : "확인 중"}</strong><small>{paperAccount ? `포지션 ${Object.keys(paperAccount.account.positions).length}개 · 원장 ${paperAccount.account.eventCount}건` : "1억원 KRW 계좌를 준비합니다."}</small></div>
@@ -519,7 +703,7 @@ export function TossSettingsDialog({ open, onClose, onSnapshot, onPaperAccount }
         </section>
         </SettingsFold>
 
-        <SettingsFold eyebrow="TOSS OPEN API" title="토스증권 자격정보" status={status.configured ? "이 PC에 저장됨" : "미설정"}>
+        <SettingsFold eyebrow="TOSS OPEN API" title="토스증권 자격정보" status={status.connected ? "연결됨" : status.configured ? "이 PC에 저장됨" : "미설정"} statusTone={connectionTone(status.connected, status.configured)}>
         <form className="settings-form" onSubmit={handleSave}>
           <label htmlFor="toss-client-id">Client ID</label>
           <input
@@ -557,13 +741,11 @@ export function TossSettingsDialog({ open, onClose, onSnapshot, onPaperAccount }
             </button>}
             {confirmingDelete && <button type="button" onClick={() => setConfirmingDelete(false)} disabled={busy}>취소</button>}
           </div>
-          <SettingsFold eyebrow="AI PROVIDERS" title="분석 모델 연결" status={codexStatus?.connected ? "Codex 연결됨" : "사용자 설정 필요"}>
-          <section className="settings-ai-connections" aria-labelledby="ai-connections-title">
-            <div><span>AI PROVIDERS</span><h3 id="ai-connections-title">분석 모델 연결</h3></div>
-            <article className={codexStatus?.connected ? "is-connected" : ""}><i aria-hidden="true" /><div><strong>Codex</strong><span>{codexStatus?.connected ? `${codexStatus.version ?? "CLI"} · ${codexStatus.authMode ?? "로그인"}` : codexStatus?.message ?? "상태 확인 중"}</span></div><b>{codexStatus?.connected ? "연결됨" : "사용자 설정 필요"}</b></article>
-            <article><i aria-hidden="true" /><div><strong>Claude</strong><span>Anthropic API 어댑터와 사용자 API 키 필요</span></div><b>어댑터 필요</b></article>
-            <p>내부 전략 파일과 AI 자격정보는 저장소에 포함하지 않습니다. 배포 사용자가 로컬 환경에서 직접 연결하며 AI에는 계좌 키와 주문 권한을 전달하지 않습니다.</p>
-          </section>
+          <SettingsFold eyebrow="LOGIN PROVIDERS" title="로그인 공급자" status="GitHub 기본 · Google 선택 · Apple 준비 중" statusTone="partial">
+            <SocialLoginSettings open={open} />
+          </SettingsFold>
+          <SettingsFold eyebrow="AI PROVIDERS" title="분석 모델 연결" status={codexStatus?.connected ? "Codex 연결됨" : "사용자 설정 필요"} statusTone={connectionTone(Boolean(codexStatus?.connected))}>
+          <AiProviderConnections open={open} codexStatus={codexStatus} />
           </SettingsFold>
         </footer>
       </div>

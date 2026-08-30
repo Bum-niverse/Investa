@@ -1,0 +1,12 @@
+# Python 3.14 / Windows x86-64 공식 wheel로 검증한 직접·전이 의존성입니다.
+# 앱 저장소 밖 전용 venv에 `pip install --require-hashes -r`로 설치합니다.
+numpy==2.4.3 \
+    --hash=sha256:0448e7f9caefb34b4b7dd2b77f21e8906e5d6f0365ad525f9f4f530b13df2afc
+scipy==1.17.1 \
+    --hash=sha256:3877ac408e14da24a6196de0ddcace62092bfc12a83823e92e49e40747e52c19
+narwhals==2.25.0 \
+    --hash=sha256:1f0f403e8c7e4463cde9bfe78b12fdd809e3ae3dda6d9b2f802934fb9c7a6a8f
+lightgbm==4.7.0 \
+    --hash=sha256:f42d1e5b32b6f170e606d7c689c6165671da98d7bf37f1addec2623efc8740c9
+xgboost==3.4.1 \
+    --hash=sha256:2d30fa513673101f542fdcbd18f30c8f96c064046f798635ac08663e9969f81b

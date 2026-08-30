@@ -1,0 +1,35 @@
+name: macos-compatibility-manual
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos-compatibility:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.19.0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Frontend tests
+        run: pnpm test:frontend
+      - name: Frontend build
+        run: pnpm build
+      - name: Rust formatting
+        run: cargo fmt --check --manifest-path src-tauri/Cargo.toml
+      - name: Rust compatibility check
+        run: cargo check --manifest-path src-tauri/Cargo.toml
+      - name: Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml

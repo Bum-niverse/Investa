@@ -187,21 +187,6 @@ def new_features() -> list[dict[str, Any]]:
             "amber",
         ),
         feature(
-            "feat-data-official-news-community-adapters",
-            "feat-data-ingestion",
-            "공식 뉴스·커뮤니티 공급자 어댑터",
-            "현재의 정규화 계약과 Telegram 자료 외에 이용약관이 허용된 뉴스·커뮤니티 공급자를 읽기 전용으로 연결한다.",
-            "planned",
-            "medium",
-            "뉴스·심리 분석가 · 시장데이터 엔지니어",
-            [
-                ("공식 API·사용자 내보내기·라이선스가 확인된 공급자만 채택한다.", False),
-                ("뉴스 사실과 커뮤니티 심리·확산량을 분리하고 중복·봇 의심을 표시한다.", False),
-                ("수집 실패·rate limit·유료 한도에서 기존 근거를 최신 정보처럼 재사용하지 않는다.", False),
-            ],
-            "amber",
-        ),
-        feature(
             "feat-pr-tistory-manual-publish-package",
             "req-public-relations",
             "티스토리 수동 게시 패키지 내보내기",
@@ -317,12 +302,13 @@ DONE_ALL = {
     "role-alert-killswitch-operator",
     "feat-research-walk-forward",
     "feat-dashboard-overview",
+    "feat-crypto-binance-private-verification",
+    "feat-workspace-settings",
 }
 
 
 PARTIAL_CHECKS: dict[str, set[int]] = {
     "req-organization": {0, 1, 3},
-    "feat-workspace-settings": {0, 2},
     "feat-trading-room-hierarchy": {0, 1, 2, 3},
     "feat-account-bound-provider-verification": {0, 2},
     "feat-sec-live-contact-verification": {0},
@@ -359,7 +345,6 @@ NEW_PARTIAL_CHECKS: dict[str, set[int]] = {
     "feat-codex-long-session-recovery-ux": {0, 2},
     "feat-futures-official-product-lifecycle": {1, 2, 3},
     "feat-market-nasdaq-official-feed": {1, 2},
-    "feat-data-official-news-community-adapters": {1, 2},
 }
 
 
@@ -432,7 +417,8 @@ def normalize_prd(markdown: str, counts: dict[str, int]) -> str:
             "- 실제 구현된 44인 로스터와 역할별 Codex 정책·RoleReport 계약을 조직도 역할 노드에 반영했다. 외부 계좌 왕복·24시간 운영·전용 엔진이 필요한 직원 기능은 부분 체크로 남겼다.",
             "- 잘못 배치된 토스 계좌 잔고 UI를 브로커 대분류로 옮기고 기능 정렬 순서를 트리 기준으로 고유하게 다시 부여했다.",
             "- 중복된 PRD 장 번호를 현재 문서 순서대로 다시 매기고 기능 부모·유저플로 연결·edge 무결성을 재검사했다.",
-            "- 누락됐던 보호 판정 운영 화면, 원장 기반 포트폴리오 위험 UI, 청산 사유, 운영 DB 복원, 선물 공식 생명주기, Codex 장시간 복구, NASDAQ 공급자, 섀도우 내구 검사, 공식 뉴스·커뮤니티 어댑터와 티스토리 수동 게시 패키지 노드를 추가했다.",
+            "- 누락됐던 보호 판정 운영 화면, 원장 기반 포트폴리오 위험 UI, 청산 사유, 운영 DB 복원, 선물 공식 생명주기, Codex 장시간 복구, NASDAQ 공급자, 섀도우 내구 검사와 티스토리 수동 게시 패키지 노드를 추가했다.",
+            "- 중복이던 뉴스·커뮤니티 어댑터는 공급자 선정 하위의 정식 노드 하나로 합치고 데이터 수집 하위 레거시 노드는 제거했다.",
             f"- 감사 후 기능 노드 상태: 완료 {counts['done']}개, 진행 중 {counts['in_progress']}개, 계획 {counts['planned']}개.",
         ]
     )
@@ -522,6 +508,12 @@ def main() -> None:
     with api.connect_database(database, writable=args.commit) as connection:
         current = api.get_project(connection, PROJECT_ID)
         features = copy.deepcopy(current["features"])
+        legacy_news_feature_id = "feat-data-official-news-community-adapters"
+        canonical_news_feature_id = "feat-official-news-community-adapters"
+        if any(item["id"] == legacy_news_feature_id for item in features):
+            if not any(item["id"] == canonical_news_feature_id for item in features):
+                raise RuntimeError("정식 뉴스·커뮤니티 어댑터 기능 없이 레거시 중복 노드만 존재합니다.")
+            features = [item for item in features if item["id"] != legacy_news_feature_id]
         by_id = {item["id"]: item for item in features}
 
         by_id["investa-root"]["description"] = (
@@ -567,6 +559,23 @@ def main() -> None:
                     "description": "시장·뉴스·증권사·거래소·AI 연결 페이지를 개별 접기·펼치기로 탐색하고 키보드 포커스로 조작한다.",
                     "isMet": True,
                     "sortOrder": len(account_hub["acceptanceCriteria"]),
+                }
+            )
+
+        workspace_settings = by_id["feat-workspace-settings"]
+        workspace_settings["acceptanceCriteria"][1]["description"] = (
+            "토스 공식 KR·US 캘린더의 휴장·부분 세션·미국 익일 종료를 조회하고 운영 화면에 표시한다."
+        )
+        if not any(
+            item["id"] == "ac-workspace-settings-order-session-gate"
+            for item in workspace_settings["acceptanceCriteria"]
+        ):
+            workspace_settings["acceptanceCriteria"].append(
+                {
+                    "id": "ac-workspace-settings-order-session-gate",
+                    "description": "공식 정규장 세션을 국장·미장 시장가 즉시 내부 모의체결에 fail-closed 방식으로 반영하고 장외에는 지정가 대기 주문만 허용한다.",
+                    "isMet": False,
+                    "sortOrder": len(workspace_settings["acceptanceCriteria"]),
                 }
             )
 

@@ -1,7 +1,9 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
+import type { SocialAuthStatus } from "./SocialLoginSettings";
 
 type GithubUser = { id: number; login: string; name?: string | null; avatarUrl: string };
+type SocialUser = { provider: "google"; name?: string | null; email?: string | null; avatarUrl?: string | null };
 
 function TradingChartPreview() {
   const workers = ["tablet", "talk", "laptop", "coffee", "documents", "phone", "tablet"];
@@ -15,7 +17,7 @@ function TradingChartPreview() {
     </div>
   </div>;
   return <div className="login-css-hero">
-    <div className="css-hero-copy"><span>LOCAL-FIRST AI TRADING LAB</span><h1>당신만의 투자본부를<br />설립하세요</h1><p>분석 백테스트 모의투자 기록은 당신의 계정에만 저장됩니다.<br />분석부터 자동 매매까지, 한 곳에서.</p></div>
+    <div className="css-hero-copy"><span>LOCAL-FIRST AI TRADING LAB</span><h1>당신만의 투자본부를<br />설립하세요</h1><p>분석·백테스트·모의투자 기록은 이 Windows 계정의 로컬 작업공간에 저장됩니다.<br />분석부터 자동 매매까지, 한 곳에서.</p></div>
     <section className="css-market-board" aria-label="시뮬레이션 시장 차트">
       <header><b>INVESTA MARKET LAB</b><span>POINT-IN-TIME · SHADOW DATA</span></header>
       <div className="css-market-summary"><span>KOSPI</span><strong>2,742.31</strong><i>+1.24%</i><small>1D · MA20 · VOLUME</small></div>
@@ -76,7 +78,8 @@ function TradingChartPreview() {
 }
 
 export function GitHubLoginGate({ children }: { children: ReactNode }) {
-  const [user, setUser] = useState<GithubUser | null>(null);
+  const [user, setUser] = useState<GithubUser | SocialUser | null>(null);
+  const [socialStatus, setSocialStatus] = useState<SocialAuthStatus | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -105,32 +108,51 @@ export function GitHubLoginGate({ children }: { children: ReactNode }) {
     }
   };
 
+  useEffect(() => {
+    if (!isTauri()) return;
+    void invoke<SocialAuthStatus>("social_auth_status").then(setSocialStatus).catch(() => setSocialStatus(null));
+  }, []);
+
+  const googleLogin = async () => {
+    if (busy) return;
+    setBusy(true);
+    setMessage(null);
+    try {
+      if (!isTauri()) throw new Error("Google 로그인은 Investa 데스크톱 앱에서 사용할 수 있습니다.");
+      setUser(await invoke<SocialUser>("google_login"));
+    } catch (reason) {
+      setMessage(String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   if (user) return <>{children}</>;
 
   return <main className="investa-login-shell">
     <section className="investa-login-visual" aria-label="AI 투자본부 픽셀 카페 라운지">
       <TradingChartPreview />
-      <div className="login-visual-copy"><span>LOCAL-FIRST AI TRADING LAB</span><h1>당신만의 투자본부를<br />설립하세요</h1><p>분석 백테스트 모의투자 기록은 당신의 계정에만 저장됩니다.<br />분석부터 자동 매매까지, 한 곳에서.</p></div>
+      <div className="login-visual-copy"><span>LOCAL-FIRST AI TRADING LAB</span><h1>당신만의 투자본부를<br />설립하세요</h1><p>분석·백테스트·모의투자 기록은 이 운영체제 계정의 로컬 작업공간에 저장됩니다.<br />분석부터 자동 매매까지, 한 곳에서.</p></div>
     </section>
     <section className="investa-login-panel">
       <div className="login-brand-mark" aria-hidden="true">IV</div>
       <p className="login-eyebrow">SECURE LOCAL WORKSPACE</p>
-      <h2>GitHub 계정으로 시작</h2>
-      <p className="login-description">GitHub CLI의 기존 로그인 세션으로 사용자만 확인합니다. Investa는 GitHub 토큰을 저장하지 않으며 거래소·증권사 자격정보와 로그인 정보를 분리합니다.</p>
+      <h2>계정으로 시작</h2>
+      <p className="login-description">최초 로그인 계정이 이 로컬 작업공간의 소유자가 됩니다. 이후 계정은 소유자로 로그인한 뒤 설정에서 연결해야 하며, Investa는 공급자 access token을 저장하지 않습니다.</p>
       <div className="login-boundaries">
         <span><i aria-hidden="true" />GitHub 토큰 저장 안 함</span>
-        <span><i aria-hidden="true" />금융 API 키는 Windows 보안 저장소 사용</span>
+        <span><i aria-hidden="true" />금융 API 키는 운영체제 보안 저장소 사용</span>
         <span><i aria-hidden="true" />로그인 후에도 실전 주문은 잠금</span>
       </div>
       {message && <p className="login-feedback" role="status">{message}</p>}
-      <button className="login-github-primary" disabled={busy} onClick={() => void verifySession()} type="button"><span aria-hidden="true">GH</span>{busy ? "GitHub 계정 확인 중…" : "GitHub 세션 확인"}</button>
+      <button className="login-github-primary" disabled={busy} onClick={() => void verifySession()} type="button"><span aria-hidden="true">GH</span>{busy ? "로그인 확인 중…" : "GitHub 세션 확인"}</button>
       <button className="login-github-secondary" onClick={() => void startLogin()} type="button">GitHub CLI 로그인 시작</button>
-      <div className="login-divider"><span>향후 공급자</span></div>
-      <div className="login-provider-slots" aria-label="향후 지원 검토 중인 로그인 공급자">
-        <button disabled type="button">Google <small>검토 중</small></button>
-        <button disabled type="button">Apple <small>검토 중</small></button>
+      <div className="login-divider"><span>선택 로그인</span></div>
+      <div className="login-provider-slots" aria-label="선택 로그인 공급자">
+        <button disabled={busy || !socialStatus?.googleConfigured} onClick={() => void googleLogin()} type="button">Google <small>{busy ? "확인 중…" : socialStatus?.googleConfigured ? "PKCE" : "설정 필요"}</small></button>
+        <button disabled title="Apple Developer Services ID와 HTTPS 콜백 설정 후 사용할 수 있습니다." type="button">Apple <small>Developer 설정 필요</small></button>
       </div>
-      <small className="login-local-note">이 로그인은 앱 진입을 구분하지만 로컬 SQLite 자체를 암호화하지는 않습니다. Windows 계정 잠금도 함께 사용하세요.</small>
+      <small className="login-local-note">연결하지 않은 계정은 같은 운영체제 사용자여도 이 작업공간을 열 수 없습니다. 로컬 SQLite 자체를 암호화하지는 않으므로 운영체제 계정 잠금과 디스크 보호도 함께 사용하세요.</small>
     </section>
   </main>;
 }

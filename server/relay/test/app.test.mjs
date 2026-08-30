@@ -13,6 +13,7 @@ const config = {
   maxClockSkewSeconds: 300,
   leaseSeconds: 90,
   maxRequestsPerMinute: 60,
+  jobRetentionHours: 24,
 };
 
 function repository() {
@@ -71,9 +72,20 @@ test("telegram webhook rejects unknown users and creates an idempotent job", asy
   assert.equal((await app(request)).status, 200);
   assert.equal(messages.length, 1);
   assert.equal(store.documents.get("relay_jobs/telegram-42").instruction, "한화 분석해줘");
+  assert.equal(store.documents.get("relay_jobs/telegram-42").expiresAtMs, NOW + 24 * 3_600_000);
 
   update.message.from.id = 999;
   assert.equal((await app({ ...request, body: JSON.stringify(update) })).status, 403);
+});
+
+test("telegram webhook rejects secrets before creating a Firestore job", async () => {
+  const store = repository();
+  const app = createRelayApp({ config, repository: store, telegram: { sendMessage: async () => {} }, now: () => NOW });
+  const update = { update_id: 43, message: { from: { id: 123456789 }, chat: { id: 123456789 }, text: "api_key=abcdefghijklmnopqrstuvwxyz123456" } };
+  const response = await app({ method: "POST", pathname: "/telegram/webhook", body: JSON.stringify(update), remoteAddress: "telegram", headers: { "x-telegram-bot-api-secret-token": config.telegramWebhookSecret } });
+  assert.equal(response.status, 400);
+  assert.equal(JSON.parse(response.body).error, "sensitive_instruction");
+  assert.equal(store.documents.has("relay_jobs/telegram-43"), false);
 });
 
 test("desktop pull requires a valid non-replayed signature", async () => {
@@ -110,4 +122,20 @@ test("result endpoint reports local approval without enabling live orders", asyn
   }, "nonce_result_1234567890"));
   assert.equal(response.status, 200);
   assert.equal(messages[0][1], "PC의 로컬 승인을 기다립니다.");
+});
+
+test("result endpoint refuses to forward or store secrets", async () => {
+  const store = repository();
+  await store.createOnce("relay_jobs", "telegram-10", {
+    jobId: "telegram-10", sourceRequestId: "update:10", sourceUserId: "123456789", sourceChatId: "123456789",
+    instruction: "상태 알려줘", status: "leased", leasedBy: "desktop-1", leaseExpiresAtMs: NOW + 90_000, createdAtMs: NOW, updatedAtMs: NOW,
+  });
+  const messages = [];
+  const app = createRelayApp({ config, repository: store, telegram: { sendMessage: async (...args) => messages.push(args) }, now: () => NOW });
+  const response = await app(signedRequest("/v1/jobs/telegram-10/result", {
+    deviceId: "desktop-1", localJobId: "remote:2", status: "completed", resultText: "authorization: Bearer abcdefghijklmnopqrstuvwxyz",
+  }, "nonce_result_secret_1234"));
+  assert.equal(response.status, 400);
+  assert.equal(messages.length, 0);
+  assert.equal(store.documents.get("relay_jobs/telegram-10").resultText, undefined);
 });

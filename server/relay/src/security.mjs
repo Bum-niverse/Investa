@@ -37,3 +37,14 @@ export function verifyDesktopRequest({ headers, method, pathname, body, secret, 
 export function verifyTelegramSecret(actual, expected) {
   return Boolean(actual) && safeEqual(actual, expected);
 }
+
+const SENSITIVE_PATTERNS = [
+  /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/i,
+  /\b(?:ghp|github_pat|sk-proj|xox[baprs]|AIza)[A-Za-z0-9_-]{12,}\b/,
+  /\b(?:api[_ -]?key|secret(?:[_ -]?key)?|access[_ -]?token|refresh[_ -]?token|password|비밀번호|시크릿)\s*[:=]\s*\S{8,}/i,
+  /\b(?:authorization)\s*:\s*(?:bearer|basic)\s+\S+/i,
+];
+
+export function containsSecretMarker(value) {
+  return typeof value === "string" && SENSITIVE_PATTERNS.some((pattern) => pattern.test(value));
+}

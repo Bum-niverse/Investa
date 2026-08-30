@@ -1,4 +1,4 @@
-import { canRestartInterruptedWorkflow, recoveryStageLabel, type RecoveryJobSummary } from "./workflowRecovery";
+import { canRestartInterruptedWorkflow, recoveryActionLabel, recoveryProgress, recoveryStageLabel, type RecoveryJobSummary } from "./workflowRecovery";
 
 type Props<T extends RecoveryJobSummary> = {
   error: string | null;
@@ -13,9 +13,9 @@ export function MeetingRecoveryStrip<T extends RecoveryJobSummary>({ error, jobs
   if (!error && jobs.length === 0) return null;
   return <section className="recovery-strip" aria-live="polite" aria-label="운영 복구">
     {error && <div role="alert"><strong>운영 엔진 확인 필요</strong><p>{error}</p><button type="button" onClick={onRetryOperations}>다시 확인</button></div>}
-    {jobs.map((job) => <div key={job.jobId}><strong>중단된 회의 · {recoveryStageLabel(job.stage)}</strong><p>{job.topic}</p><span>
-      <button type="button" disabled={!canRestartInterruptedWorkflow(activeMeetingTopic, job)} onClick={() => onRestart(job)}>처음부터 다시 실행</button>
+    {jobs.map((job) => { const progress = recoveryProgress(job); return <div key={job.jobId}><strong>중단된 회의 · {recoveryStageLabel(job.stage)}</strong><p>{job.topic}{progress.total > 0 ? ` · 부서 보고 ${progress.completed}/${progress.total}` : ""}</p><span>
+      <button type="button" disabled={!canRestartInterruptedWorkflow(activeMeetingTopic, job)} onClick={() => onRestart(job)}>{recoveryActionLabel(job)}</button>
       <button type="button" onClick={() => onDismiss(job.jobId)}>기록 닫기</button>
-    </span></div>)}
+    </span></div> })}
   </section>;
 }

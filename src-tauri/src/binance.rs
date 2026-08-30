@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
 use hmac::{Hmac, Mac};
 use keyring::{Entry, Error as KeyringError};
@@ -6,6 +6,10 @@ use reqwest::{Client, StatusCode};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::Sha256;
 use tauri::State;
+
+use crate::market_data::{
+    public_market_analysis_snapshot, AnalysisSnapshot, AnalysisSnapshotRequest, TossChartBar,
+};
 
 const SPOT_BASE: &str = "https://api.binance.com";
 const USDM_BASE: &str = "https://fapi.binance.com";
@@ -72,9 +76,71 @@ pub struct BinanceAccountSnapshot {
     provider: &'static str,
     fetched_at_ms: u64,
     read_only: bool,
+    permission_verified: bool,
+    permission_message: String,
     spot: BinanceAccountSection,
     usd_m: BinanceAccountSection,
     coin_m: BinanceAccountSection,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BinanceApiRestrictions {
+    #[serde(default)]
+    ip_restrict: bool,
+    #[serde(default)]
+    enable_reading: bool,
+    #[serde(default)]
+    enable_withdrawals: bool,
+    #[serde(default)]
+    enable_internal_transfer: bool,
+    #[serde(default)]
+    enable_margin: bool,
+    #[serde(default)]
+    enable_futures: bool,
+    #[serde(default)]
+    permits_universal_transfer: bool,
+    #[serde(default)]
+    enable_vanilla_options: bool,
+    #[serde(default)]
+    enable_fix_api_trade: bool,
+    #[serde(default)]
+    enable_spot_and_margin_trading: bool,
+    #[serde(default)]
+    enable_portfolio_margin_trading: bool,
+}
+
+fn validate_api_restrictions(value: &BinanceApiRestrictions) -> Result<(), String> {
+    if !value.enable_reading {
+        return Err("Binance API 키의 읽기 권한이 필요합니다.".to_owned());
+    }
+    if !value.ip_restrict {
+        return Err("Binance API 키에 이 PC의 고정 IP 제한을 먼저 적용해 주세요.".to_owned());
+    }
+    let risky = [
+        (value.enable_withdrawals, "출금"),
+        (value.enable_internal_transfer, "내부 이체"),
+        (value.enable_margin, "마진"),
+        (value.enable_futures, "선물 거래"),
+        (value.permits_universal_transfer, "통합 이체"),
+        (value.enable_vanilla_options, "옵션 거래"),
+        (value.enable_fix_api_trade, "FIX 거래"),
+        (value.enable_spot_and_margin_trading, "현물·마진 거래"),
+        (
+            value.enable_portfolio_margin_trading,
+            "포트폴리오 마진 거래",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(enabled, label)| enabled.then_some(label))
+    .collect::<Vec<_>>();
+    if !risky.is_empty() {
+        return Err(format!(
+            "Investa는 읽기 전용 Binance 키만 저장합니다. 다음 권한을 끄세요: {}",
+            risky.join(", ")
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -125,6 +191,25 @@ struct SpotTicker {
 struct MarkPrice {
     symbol: String,
     mark_price: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FundingRate {
+    symbol: String,
+    funding_time: u64,
+    funding_rate: String,
+}
+
+#[derive(Debug, Clone)]
+struct PublicKline {
+    period_start_ms: u64,
+    period_end_ms: u64,
+    open_minor: u64,
+    high_minor: u64,
+    low_minor: u64,
+    close_minor: u64,
+    volume: u64,
 }
 
 #[derive(Deserialize)]
@@ -422,6 +507,16 @@ async fn account_snapshot(
     bridge: &BinanceBridge,
     credentials: &BinanceCredentials,
 ) -> Result<BinanceAccountSnapshot, String> {
+    let restrictions = signed_get::<BinanceApiRestrictions>(
+        bridge,
+        credentials,
+        SPOT_BASE,
+        "/api/v3/time",
+        "/sapi/v1/account/apiRestrictions",
+        "API 권한",
+    )
+    .await?;
+    validate_api_restrictions(&restrictions)?;
     let spot = spot_section(bridge, credentials).await;
     let usd_m = futures_section(bridge, credentials, false).await;
     let coin_m = futures_section(bridge, credentials, true).await;
@@ -432,6 +527,8 @@ async fn account_snapshot(
         provider: "Binance",
         fetched_at_ms: crate::paper_trading::now_ms()?,
         read_only: true,
+        permission_verified: true,
+        permission_message: "읽기 권한·IP 제한 확인됨 · 거래·출금·이체 권한 비활성".to_owned(),
         spot,
         usd_m,
         coin_m,
@@ -461,6 +558,95 @@ async fn public_json<T: DeserializeOwned>(
         .map_err(|_| format!("Binance {product} 공개 시세 형식이 올바르지 않습니다."))
 }
 
+fn parse_positive_decimal(value: &str, scale: f64, label: &str) -> Result<u64, String> {
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|_| format!("Binance {label} 숫자를 해석하지 못했습니다."))?;
+    let scaled = parsed * scale;
+    if !scaled.is_finite() || scaled < 0.0 || scaled > u64::MAX as f64 {
+        return Err(format!("Binance {label} 값이 지원 범위를 벗어났습니다."));
+    }
+    Ok(scaled.round() as u64)
+}
+
+fn parse_public_klines(
+    rows: Vec<Vec<serde_json::Value>>,
+    label: &str,
+) -> Result<Vec<PublicKline>, String> {
+    let mut bars = Vec::with_capacity(rows.len());
+    for row in rows {
+        if row.len() < 7 {
+            return Err(format!("Binance {label} 봉 응답 필드가 부족합니다."));
+        }
+        let text = |index: usize| {
+            row[index]
+                .as_str()
+                .ok_or_else(|| format!("Binance {label} 봉 숫자 형식이 올바르지 않습니다."))
+        };
+        let period_start_ms = row[0]
+            .as_u64()
+            .ok_or_else(|| format!("Binance {label} 봉 시작 시각이 올바르지 않습니다."))?;
+        let period_end_ms = row[6]
+            .as_u64()
+            .ok_or_else(|| format!("Binance {label} 봉 종료 시각이 올바르지 않습니다."))?;
+        let open_minor = parse_positive_decimal(text(1)?, 100.0, label)?;
+        let high_minor = parse_positive_decimal(text(2)?, 100.0, label)?;
+        let low_minor = parse_positive_decimal(text(3)?, 100.0, label)?;
+        let close_minor = parse_positive_decimal(text(4)?, 100.0, label)?;
+        if period_end_ms <= period_start_ms
+            || low_minor > open_minor
+            || low_minor > close_minor
+            || high_minor < open_minor
+            || high_minor < close_minor
+        {
+            return Err(format!(
+                "Binance {label} 봉 시간 또는 OHLC 관계가 올바르지 않습니다."
+            ));
+        }
+        bars.push(PublicKline {
+            period_start_ms,
+            period_end_ms,
+            open_minor,
+            high_minor,
+            low_minor,
+            close_minor,
+            volume: parse_positive_decimal(text(5)?, 100_000_000.0, "거래량")?,
+        });
+    }
+    bars.sort_by_key(|bar| bar.period_start_ms);
+    if bars.windows(2).any(|pair| {
+        pair[0].period_start_ms == pair[1].period_start_ms
+            || pair[0].period_end_ms >= pair[1].period_end_ms
+    }) {
+        return Err(format!(
+            "Binance {label} 봉 시계열에 중복 또는 역순 데이터가 있습니다."
+        ));
+    }
+    Ok(bars)
+}
+
+fn resolve_perpetual_symbol(query: &str) -> Result<String, String> {
+    let normalized = query.trim().to_ascii_uppercase();
+    for token in normalized.split(|character: char| !character.is_ascii_alphanumeric()) {
+        if (7..=20).contains(&token.len()) && token.ends_with("USDT") {
+            return Ok(token.to_owned());
+        }
+    }
+    if normalized.contains("비트코인") || normalized.contains("BTC") {
+        return Ok("BTCUSDT".to_owned());
+    }
+    if normalized.contains("이더리움") || normalized.contains("ETH") {
+        return Ok("ETHUSDT".to_owned());
+    }
+    if normalized.contains("리플") || normalized.contains("XRP") {
+        return Ok("XRPUSDT".to_owned());
+    }
+    Err(
+        "분석 요청에서 Binance USDⓈ-M 무기한선물 심볼을 확정하지 못했습니다. 예: BTCUSDT"
+            .to_owned(),
+    )
+}
+
 #[tauri::command]
 pub fn binance_connection_status() -> Result<BinanceConnectionStatus, String> {
     Ok(match load_credentials()? {
@@ -477,9 +663,8 @@ pub fn binance_connection_status() -> Result<BinanceConnectionStatus, String> {
     })
 }
 
-#[tauri::command]
-pub async fn binance_public_snapshot(
-    bridge: State<'_, BinanceBridge>,
+async fn fetch_binance_public_snapshot(
+    bridge: &BinanceBridge,
 ) -> Result<BinancePublicSnapshot, String> {
     let spot = public_json::<SpotTicker>(
         &bridge,
@@ -520,6 +705,124 @@ pub async fn binance_public_snapshot(
             price: coin_m.mark_price,
         },
     })
+}
+
+#[tauri::command]
+pub async fn binance_public_snapshot(
+    bridge: State<'_, BinanceBridge>,
+) -> Result<BinancePublicSnapshot, String> {
+    fetch_binance_public_snapshot(&bridge).await
+}
+
+async fn fetch_perpetual_analysis_snapshot(
+    request: AnalysisSnapshotRequest,
+    bridge: &BinanceBridge,
+) -> Result<AnalysisSnapshot, String> {
+    if request.query.trim().is_empty()
+        || request.query.chars().count() > 500
+        || request.query.chars().any(char::is_control)
+    {
+        return Err("Binance 분석 요청은 한 줄 1자 이상 500자 이하여야 합니다.".to_owned());
+    }
+    if !(60..=500).contains(&request.count) {
+        return Err("Binance 분석 스냅샷 봉은 60개에서 500개 사이여야 합니다.".to_owned());
+    }
+    let symbol = resolve_perpetual_symbol(&request.query)?;
+    let limit = request.count.to_string();
+    let trade_rows = public_json::<Vec<Vec<serde_json::Value>>>(bridge, format!("{USDM_BASE}/fapi/v1/continuousKlines?pair={symbol}&contractType=PERPETUAL&interval=4h&limit={limit}"), "USDⓈ-M 체결 봉").await?;
+    let mark_rows = public_json::<Vec<Vec<serde_json::Value>>>(
+        bridge,
+        format!("{USDM_BASE}/fapi/v1/markPriceKlines?symbol={symbol}&interval=4h&limit={limit}"),
+        "USDⓈ-M 마크가격 봉",
+    )
+    .await?;
+    let index_rows = public_json::<Vec<Vec<serde_json::Value>>>(
+        bridge,
+        format!("{USDM_BASE}/fapi/v1/indexPriceKlines?pair={symbol}&interval=4h&limit={limit}"),
+        "USDⓈ-M 지수가격 봉",
+    )
+    .await?;
+    let funding = public_json::<Vec<FundingRate>>(
+        bridge,
+        format!("{USDM_BASE}/fapi/v1/fundingRate?symbol={symbol}&limit=1000"),
+        "USDⓈ-M 펀딩",
+    )
+    .await?;
+    if funding.iter().any(|item| item.symbol != symbol) {
+        return Err("Binance 펀딩 응답에 다른 심볼이 포함되었습니다.".to_owned());
+    }
+    let fetched_at_ms = crate::paper_trading::now_ms()?;
+    let trade = parse_public_klines(trade_rows, "체결")?;
+    let mark: HashMap<u64, PublicKline> = parse_public_klines(mark_rows, "마크가격")?
+        .into_iter()
+        .map(|bar| (bar.period_start_ms, bar))
+        .collect();
+    let index: HashMap<u64, PublicKline> = parse_public_klines(index_rows, "지수가격")?
+        .into_iter()
+        .map(|bar| (bar.period_start_ms, bar))
+        .collect();
+    let funding_by_time: HashMap<u64, f64> = funding
+        .into_iter()
+        .map(|item| {
+            let bps = item
+                .funding_rate
+                .parse::<f64>()
+                .map(|rate| rate * 10_000.0)
+                .map_err(|_| "Binance 펀딩 비율을 해석하지 못했습니다.".to_owned())?;
+            if !bps.is_finite() {
+                return Err("Binance 펀딩 비율이 유효하지 않습니다.".to_owned());
+            }
+            Ok((item.funding_time, bps))
+        })
+        .collect::<Result<_, String>>()?;
+    let mut bars = Vec::new();
+    for bar in trade
+        .into_iter()
+        .filter(|bar| bar.period_end_ms <= fetched_at_ms)
+    {
+        let mark_bar = mark
+            .get(&bar.period_start_ms)
+            .ok_or_else(|| "Binance 마크가격 봉이 체결 봉과 일치하지 않습니다.".to_owned())?;
+        let index_bar = index
+            .get(&bar.period_start_ms)
+            .ok_or_else(|| "Binance 지수가격 봉이 체결 봉과 일치하지 않습니다.".to_owned())?;
+        let funding_observation = funding_by_time
+            .iter()
+            .filter(|(time, _)| **time > bar.period_start_ms && **time <= bar.period_end_ms)
+            .max_by_key(|(time, _)| **time);
+        bars.push(TossChartBar {
+            period_start_ms: bar.period_start_ms,
+            period_end_ms: bar.period_end_ms,
+            open_minor: bar.open_minor,
+            high_minor: bar.high_minor,
+            low_minor: bar.low_minor,
+            close_minor: bar.close_minor,
+            volume: bar.volume,
+            completed: true,
+            available_at_ms: Some(bar.period_end_ms),
+            ingested_at_ms: Some(fetched_at_ms),
+            session_id: Some("BINANCE-24H".to_owned()),
+            contract_code: Some(symbol.clone()),
+            settlement_price_minor: None,
+            mark_price_minor: Some(mark_bar.close_minor),
+            index_price_minor: Some(index_bar.close_minor),
+            funding_rate_bps: funding_observation.map(|(_, rate)| *rate),
+            funding_time_ms: funding_observation.map(|(time, _)| *time),
+        });
+    }
+    public_market_analysis_snapshot(
+        "BINANCE_USDM_PUBLIC_API", symbol.clone(), symbol.clone(), "crypto_perpetual".to_owned(),
+        "crypto_perpetual", "USD".to_owned(), "4h".to_owned(), fetched_at_ms, bars,
+        vec!["체결·마크·지수 봉을 동일 시작 시각으로 교차 검증했으며 펀딩은 실제 관측 시각에만 표시합니다.".to_owned()],
+    )
+}
+
+#[tauri::command]
+pub async fn binance_perpetual_analysis_snapshot(
+    request: AnalysisSnapshotRequest,
+    bridge: State<'_, BinanceBridge>,
+) -> Result<AnalysisSnapshot, String> {
+    fetch_perpetual_analysis_snapshot(request, &bridge).await
 }
 
 #[tauri::command]
@@ -573,5 +876,140 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.len(), 64);
         assert!(!first.contains(secret));
+    }
+
+    #[test]
+    fn rejects_binance_keys_with_trading_or_missing_ip_restriction() {
+        let safe = BinanceApiRestrictions {
+            ip_restrict: true,
+            enable_reading: true,
+            enable_withdrawals: false,
+            enable_internal_transfer: false,
+            enable_margin: false,
+            enable_futures: false,
+            permits_universal_transfer: false,
+            enable_vanilla_options: false,
+            enable_fix_api_trade: false,
+            enable_spot_and_margin_trading: false,
+            enable_portfolio_margin_trading: false,
+        };
+        assert!(validate_api_restrictions(&safe).is_ok());
+
+        let no_ip = BinanceApiRestrictions {
+            ip_restrict: false,
+            ..safe
+        };
+        assert!(validate_api_restrictions(&no_ip).is_err());
+
+        let trading = BinanceApiRestrictions {
+            ip_restrict: true,
+            enable_spot_and_margin_trading: true,
+            ..no_ip
+        };
+        assert!(validate_api_restrictions(&trading).is_err());
+    }
+
+    #[test]
+    fn perpetual_symbol_resolver_accepts_explicit_and_korean_aliases() {
+        assert_eq!(
+            resolve_perpetual_symbol("BTCUSDT 4시간봉").unwrap(),
+            "BTCUSDT"
+        );
+        assert_eq!(
+            resolve_perpetual_symbol("비트코인 무기한 선물").unwrap(),
+            "BTCUSDT"
+        );
+        assert_eq!(
+            resolve_perpetual_symbol("이더리움 perp").unwrap(),
+            "ETHUSDT"
+        );
+        assert!(resolve_perpetual_symbol("심볼 없는 요청").is_err());
+    }
+
+    #[test]
+    fn public_kline_parser_preserves_point_in_time_boundaries() {
+        let rows = vec![vec![
+            serde_json::json!(1_000_u64),
+            serde_json::json!("100.00"),
+            serde_json::json!("110.00"),
+            serde_json::json!("90.00"),
+            serde_json::json!("105.00"),
+            serde_json::json!("12.5"),
+            serde_json::json!(2_000_u64),
+        ]];
+        let parsed = parse_public_klines(rows, "테스트").expect("parse");
+        assert_eq!(parsed[0].period_start_ms, 1_000);
+        assert_eq!(parsed[0].period_end_ms, 2_000);
+        assert_eq!(parsed[0].close_minor, 10_500);
+        assert_eq!(parsed[0].volume, 1_250_000_000);
+    }
+
+    #[test]
+    fn public_kline_parser_rejects_invalid_ohlc() {
+        let rows = vec![vec![
+            serde_json::json!(1_000_u64),
+            serde_json::json!("100"),
+            serde_json::json!("95"),
+            serde_json::json!("90"),
+            serde_json::json!("105"),
+            serde_json::json!("1"),
+            serde_json::json!(2_000_u64),
+        ]];
+        assert!(parse_public_klines(rows, "테스트").is_err());
+    }
+
+    #[test]
+    #[ignore = "저장된 Binance 자격정보와 외부 개인계좌 서버를 사용하는 명시적 읽기 전용 검사"]
+    fn live_binance_account_snapshot_uses_stored_read_only_credentials() {
+        let credentials = load_credentials()
+            .expect("credential store")
+            .expect("stored Binance credentials");
+        let snapshot = tauri::async_runtime::block_on(account_snapshot(
+            &BinanceBridge::default(),
+            &credentials,
+        ))
+        .expect("Binance read-only account snapshot");
+        assert!(snapshot.read_only);
+        assert!(snapshot.permission_verified);
+        assert!(snapshot.spot.connected || snapshot.usd_m.connected || snapshot.coin_m.connected);
+        eprintln!(
+            "BINANCE_ACCOUNT_CONNECTED=true read_only=true spot={} usd_m={} coin_m={} usd_m_status={:?} coin_m_status={:?}",
+            snapshot.spot.connected,
+            snapshot.usd_m.connected,
+            snapshot.coin_m.connected,
+            snapshot.usd_m.message,
+            snapshot.coin_m.message
+        );
+    }
+
+    #[test]
+    #[ignore = "Binance 공개 USDⓈ-M API와 외부 네트워크를 사용하는 명시적 통합 검사"]
+    fn live_binance_perpetual_snapshot_aligns_trade_mark_index_and_funding() {
+        let snapshot = tauri::async_runtime::block_on(fetch_perpetual_analysis_snapshot(
+            AnalysisSnapshotRequest {
+                query: "BTCUSDT 무기한선물".to_owned(),
+                count: 60,
+            },
+            &BinanceBridge::default(),
+        ))
+        .expect("public perpetual snapshot");
+        assert_eq!(snapshot.asset_class, "crypto_perpetual");
+        assert!(snapshot.completed_bar_count >= 20);
+        assert!(snapshot
+            .bars
+            .iter()
+            .all(|bar| bar.mark_price_minor.is_some() && bar.index_price_minor.is_some()));
+    }
+
+    #[test]
+    #[ignore = "Binance 공개 현물·USDⓈ-M·COIN-M API를 사용하는 명시적 통합 검사"]
+    fn live_binance_public_markets_return_positive_prices() {
+        let snapshot = tauri::async_runtime::block_on(fetch_binance_public_snapshot(
+            &BinanceBridge::default(),
+        ))
+        .expect("public Binance markets");
+        for quote in [&snapshot.spot, &snapshot.usd_m, &snapshot.coin_m] {
+            assert!(quote.price.parse::<f64>().expect("price") > 0.0);
+        }
     }
 }

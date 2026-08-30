@@ -21,12 +21,17 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost http://localhost:1430 ws://localhost:1430; img-src 'self' asset: http://asset.localhost data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:"
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost wss://api.upbit.com wss://stream.binance.com:9443 wss://fstream.binance.com wss://dstream.binance.com; img-src 'self' asset: http://asset.localhost data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+      "devCsp": "default-src 'self'; connect-src ipc: http://ipc.localhost http://localhost:1430 ws://localhost:1430 wss://api.upbit.com wss://stream.binance.com:9443 wss://fstream.binance.com wss://dstream.binance.com; img-src 'self' asset: http://asset.localhost data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
     }
   },
   "bundle": {
     "active": true,
     "targets": "all",
+    "resources": {
+      "../ml-worker/investa_ml_worker.py": "ml-worker/investa_ml_worker.py",
+      "../ml-worker/requirements.lock": "ml-worker/requirements.lock"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

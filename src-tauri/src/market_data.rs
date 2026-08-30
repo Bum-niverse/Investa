@@ -1,6 +1,6 @@
 use keyring::{Entry, Error as KeyringError};
 use reqwest::{Client, StatusCode};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -174,14 +174,32 @@ pub struct TossChartRequest {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TossChartBar {
-    period_start_ms: u64,
-    period_end_ms: u64,
-    open_minor: u64,
-    high_minor: u64,
-    low_minor: u64,
-    close_minor: u64,
-    volume: u64,
-    completed: bool,
+    pub(crate) period_start_ms: u64,
+    pub(crate) period_end_ms: u64,
+    pub(crate) open_minor: u64,
+    pub(crate) high_minor: u64,
+    pub(crate) low_minor: u64,
+    pub(crate) close_minor: u64,
+    pub(crate) volume: u64,
+    pub(crate) completed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) available_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) ingested_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) contract_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) settlement_price_minor: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) mark_price_minor: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) index_price_minor: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) funding_rate_bps: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) funding_time_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -239,9 +257,9 @@ pub struct StockSearchRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AnalysisSnapshotRequest {
-    query: String,
+    pub(crate) query: String,
     #[serde(default = "default_analysis_bar_count")]
-    count: u16,
+    pub(crate) count: u16,
 }
 
 fn default_analysis_bar_count() -> u16 {
@@ -251,24 +269,24 @@ fn default_analysis_bar_count() -> u16 {
 #[derive(Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AnalysisIndicatorSnapshot {
-    sma_5: Option<f64>,
-    sma_20: Option<f64>,
-    sma_60: Option<f64>,
-    rsi_14: Option<f64>,
-    atr_14: Option<f64>,
-    twenty_day_return_percent: Option<f64>,
-    twenty_day_average_volume: Option<f64>,
+    pub(crate) sma_5: Option<f64>,
+    pub(crate) sma_20: Option<f64>,
+    pub(crate) sma_60: Option<f64>,
+    pub(crate) rsi_14: Option<f64>,
+    pub(crate) atr_14: Option<f64>,
+    pub(crate) twenty_day_return_percent: Option<f64>,
+    pub(crate) twenty_day_average_volume: Option<f64>,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AnalysisDataAvailability {
-    price: String,
-    technical: String,
-    fundamentals: String,
-    filings: String,
-    news: String,
-    macro_supply: String,
+    pub(crate) price: String,
+    pub(crate) technical: String,
+    pub(crate) fundamentals: String,
+    pub(crate) filings: String,
+    pub(crate) news: String,
+    pub(crate) macro_supply: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -282,9 +300,10 @@ pub struct AnalysisSnapshot {
     currency: String,
     as_of_ms: u64,
     fetched_at_ms: u64,
-    interval: &'static str,
+    interval: String,
+    pub(crate) asset_class: String,
     adjusted: bool,
-    completed_bar_count: usize,
+    pub(crate) completed_bar_count: usize,
     latest_close_minor: u64,
     latest_volume: u64,
     indicators: AnalysisIndicatorSnapshot,
@@ -292,7 +311,7 @@ pub struct AnalysisSnapshot {
     filings: Option<SecFilingSnapshot>,
     availability: AnalysisDataAvailability,
     missing_data: Vec<String>,
-    bars: Vec<TossChartBar>,
+    pub(crate) bars: Vec<TossChartBar>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -333,6 +352,86 @@ struct MarketIndicatorPrice {
     symbol: String,
     timestamp: Option<String>,
     last_price: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MarketCalendarEnvelope<T> {
+    result: T,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MarketSessionTime {
+    start_time: String,
+    end_time: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KrMarketSessions {
+    pre_market: Option<MarketSessionTime>,
+    regular_market: Option<MarketSessionTime>,
+    after_market: Option<MarketSessionTime>,
+}
+
+#[derive(Debug, Deserialize)]
+struct KrMarketDay {
+    date: String,
+    integrated: Option<KrMarketSessions>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KrMarketCalendarResponse {
+    today: KrMarketDay,
+    previous_business_day: KrMarketDay,
+    next_business_day: KrMarketDay,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UsMarketDay {
+    date: String,
+    day_market: Option<MarketSessionTime>,
+    pre_market: Option<MarketSessionTime>,
+    regular_market: Option<MarketSessionTime>,
+    after_market: Option<MarketSessionTime>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UsMarketCalendarResponse {
+    today: UsMarketDay,
+    previous_business_day: UsMarketDay,
+    next_business_day: UsMarketDay,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NormalizedMarketSession {
+    name: String,
+    start_time: String,
+    end_time: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NormalizedMarketCalendar {
+    market: String,
+    provider: String,
+    fetched_at_ms: u64,
+    date: String,
+    holiday: bool,
+    previous_business_day: String,
+    next_business_day: String,
+    sessions: Vec<NormalizedMarketSession>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TossMarketCalendars {
+    fetched_at_ms: u64,
+    calendars: Vec<NormalizedMarketCalendar>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -605,18 +704,46 @@ fn delete_stored_credentials() -> Result<(), String> {
 }
 
 impl MarketDataBridge {
+    /// 토스 인증 WebSocket handshake 전용 토큰 조회입니다.
+    /// 이 함수는 Rust 내부에서만 사용하고 Tauri command나 직렬화 DTO로 노출하지 않습니다.
+    pub(crate) async fn toss_stream_access_token(&self) -> Result<String, String> {
+        let credentials = load_credentials()?
+            .ok_or_else(|| "토스증권 Open API 연결 정보를 먼저 등록해 주세요.".to_owned())?;
+        self.token_for(&credentials)
+            .await
+            .map_err(|error| error.message.to_owned())
+    }
+
+    pub(crate) fn clear_toss_stream_access_token(&self) -> Result<(), String> {
+        *self
+            .token_cache
+            .lock()
+            .map_err(|_| "토스증권 인증 상태를 초기화하지 못했습니다.".to_owned())? = None;
+        Ok(())
+    }
+
     pub(crate) async fn fetch_latest_strategy_bars(
         &self,
         symbol: &str,
+        interval: &str,
     ) -> Result<Vec<PriceBar>, String> {
+        let interval = match interval {
+            "1m" => CandleInterval::OneMinute,
+            "1d" => CandleInterval::OneDay,
+            _ => {
+                return Err(
+                    "저장 전략 감시는 백테스트와 동일한 1분봉 또는 일봉만 지원합니다.".to_owned(),
+                )
+            }
+        };
         let credentials = load_credentials()?
             .ok_or_else(|| "토스증권 Open API 연결 정보를 먼저 등록해 주세요.".to_owned())?;
         let ingested_at_ms = paper_trading::now_ms()?;
         let candles = self
-            .fetch_candles_with_credentials(&credentials, symbol, CandleInterval::OneDay, 200, true)
+            .fetch_candles_with_credentials(&credentials, symbol, interval, 200, true)
             .await
             .map_err(|error| error.message.to_owned())?;
-        price_bars_from_candles(symbol, CandleInterval::OneDay, candles, ingested_at_ms)
+        price_bars_from_candles(symbol, interval, candles, ingested_at_ms)
     }
     async fn issue_token(&self, credentials: &TossCredentials) -> Result<TokenCache, ApiError> {
         let response = self
@@ -757,6 +884,91 @@ impl MarketDataBridge {
                 )
             })?;
         snapshot_from_prices(envelope.result)
+    }
+
+    async fn request_calendar<T: DeserializeOwned>(
+        &self,
+        access_token: &str,
+        market: &str,
+    ) -> Result<T, ApiError> {
+        let response = self
+            .client
+            .get(format!("{API_BASE_URL}/api/v1/market-calendar/{market}"))
+            .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECONDS))
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(|_| {
+                ApiError::new(
+                    ApiErrorKind::Unavailable,
+                    "토스증권 장 캘린더 서버에 연결하지 못했습니다.",
+                )
+            })?;
+        match response.status() {
+            StatusCode::UNAUTHORIZED => {
+                return Err(ApiError::new(
+                    ApiErrorKind::Unauthorized,
+                    "토스증권 액세스 토큰이 만료되었습니다.",
+                ))
+            }
+            StatusCode::TOO_MANY_REQUESTS => {
+                return Err(ApiError::new(
+                    ApiErrorKind::RateLimited,
+                    "토스증권 장 캘린더 요청 한도를 초과했습니다.",
+                ))
+            }
+            status if !status.is_success() => {
+                return Err(ApiError::provider_status(
+                    status,
+                    "토스증권 장 캘린더 서버가 요청을 처리하지 못했습니다.",
+                ))
+            }
+            _ => {}
+        }
+        response
+            .json::<MarketCalendarEnvelope<T>>()
+            .await
+            .map(|value| value.result)
+            .map_err(|_| {
+                ApiError::new(
+                    ApiErrorKind::InvalidResponse,
+                    "토스증권 장 캘린더 응답 형식이 올바르지 않습니다.",
+                )
+            })
+    }
+
+    async fn fetch_market_calendars_with_credentials(
+        &self,
+        credentials: &TossCredentials,
+    ) -> Result<TossMarketCalendars, ApiError> {
+        let mut token = self.token_for(credentials).await?;
+        let kr = match self
+            .request_calendar::<KrMarketCalendarResponse>(&token, "KR")
+            .await
+        {
+            Err(error) if error.kind == ApiErrorKind::Unauthorized => {
+                *self.token_cache.lock().map_err(|_| {
+                    ApiError::new(
+                        ApiErrorKind::Unavailable,
+                        "인증 상태를 갱신하지 못했습니다.",
+                    )
+                })? = None;
+                token = self.token_for(credentials).await?;
+                self.request_calendar::<KrMarketCalendarResponse>(&token, "KR")
+                    .await?
+            }
+            result => result?,
+        };
+        let us = self
+            .request_calendar::<UsMarketCalendarResponse>(&token, "US")
+            .await?;
+        let fetched_at_ms = paper_trading::now_ms().map_err(|_| {
+            ApiError::new(
+                ApiErrorKind::Unavailable,
+                "장 캘린더 관측 시각을 만들지 못했습니다.",
+            )
+        })?;
+        Ok(normalize_market_calendars(kr, us, fetched_at_ms)?)
     }
 
     async fn fetch_indices_with_credentials(
@@ -1564,6 +1776,15 @@ fn chart_bars_from_candles(
                 .parse::<u64>()
                 .map_err(|_| "토스증권 캔들 거래량을 해석하지 못했습니다.".to_owned())?,
             completed: period_end_ms <= fetched_at_ms,
+            available_at_ms: Some(period_end_ms),
+            ingested_at_ms: Some(fetched_at_ms),
+            session_id: None,
+            contract_code: None,
+            settlement_price_minor: None,
+            mark_price_minor: None,
+            index_price_minor: None,
+            funding_rate_bps: None,
+            funding_time_ms: None,
         });
     }
     bars.sort_by_key(|bar| bar.period_start_ms);
@@ -1612,6 +1833,166 @@ fn snapshot_from_prices(
         refresh_after_ms: DEFAULT_REFRESH_AFTER_MS,
         message: "KOSPI·KOSDAQ 토스증권 시세 · NASDAQ 연결 대기".to_owned(),
         quotes,
+    })
+}
+
+fn validate_calendar_date(value: &str) -> Result<(), ApiError> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 10
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes
+            .iter()
+            .enumerate()
+            .any(|(index, value)| index != 4 && index != 7 && !value.is_ascii_digit())
+    {
+        return Err(ApiError::new(
+            ApiErrorKind::InvalidResponse,
+            "토스증권 장 캘린더 날짜 형식이 올바르지 않습니다.",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_official_session_timestamp_ms(value: &str) -> Result<u64, ApiError> {
+    if !(value.ends_with("+09:00") || value.ends_with('Z')) {
+        return Err(ApiError::new(
+            ApiErrorKind::InvalidResponse,
+            "토스증권 장 세션 시간대가 올바르지 않습니다.",
+        ));
+    }
+    parse_rfc3339_ms(value).ok_or_else(|| {
+        ApiError::new(
+            ApiErrorKind::InvalidResponse,
+            "토스증권 장 세션 시각 형식이 올바르지 않습니다.",
+        )
+    })
+}
+
+fn normalize_calendar_session(
+    name: &str,
+    value: Option<MarketSessionTime>,
+) -> Result<Option<NormalizedMarketSession>, ApiError> {
+    let Some(value) = value else { return Ok(None) };
+    let start_time_ms = parse_official_session_timestamp_ms(&value.start_time)?;
+    let end_time_ms = parse_official_session_timestamp_ms(&value.end_time)?;
+    if start_time_ms >= end_time_ms {
+        return Err(ApiError::new(
+            ApiErrorKind::InvalidResponse,
+            "토스증권 장 세션 시간이 올바르지 않습니다.",
+        ));
+    }
+    Ok(Some(NormalizedMarketSession {
+        name: name.to_owned(),
+        start_time: value.start_time,
+        end_time: value.end_time,
+    }))
+}
+
+fn ensure_regular_market_session(
+    calendars: &TossMarketCalendars,
+    currency: &str,
+    now_ms: u64,
+) -> Result<(), String> {
+    let market = match currency {
+        "KRW" => "KR",
+        "USD" => "US",
+        _ => return Err("국장·미장 시장가 주문 통화를 확인해 주세요.".to_owned()),
+    };
+    if calendars.fetched_at_ms > now_ms.saturating_add(60_000)
+        || now_ms.saturating_sub(calendars.fetched_at_ms) > 300_000
+    {
+        return Err(
+            "공식 장 캘린더 관측이 오래됐거나 미래 시각입니다. 다시 조회해 주세요.".to_owned(),
+        );
+    }
+    let calendar = calendars
+        .calendars
+        .iter()
+        .find(|calendar| calendar.market == market)
+        .ok_or_else(|| "공식 장 캘린더에서 선택 시장을 찾지 못했습니다.".to_owned())?;
+    if calendar.holiday {
+        return Err(format!("{} 시장은 공식 장 캘린더상 휴장입니다.", market));
+    }
+    let regular = calendar
+        .sessions
+        .iter()
+        .find(|session| session.name == "regularMarket")
+        .ok_or_else(|| "정규장 세션이 확인되지 않아 시장가 모의체결을 차단했습니다.".to_owned())?;
+    let start_ms = parse_official_session_timestamp_ms(&regular.start_time)
+        .map_err(|error| error.message.to_owned())?;
+    let end_ms = parse_official_session_timestamp_ms(&regular.end_time)
+        .map_err(|error| error.message.to_owned())?;
+    if now_ms < start_ms || now_ms >= end_ms {
+        return Err("현재 정규장 시간이 아니므로 즉시 시장가 모의체결을 차단했습니다. 지정가 대기 주문은 사용할 수 있습니다.".to_owned());
+    }
+    Ok(())
+}
+
+fn normalize_market_calendars(
+    kr: KrMarketCalendarResponse,
+    us: UsMarketCalendarResponse,
+    fetched_at_ms: u64,
+) -> Result<TossMarketCalendars, ApiError> {
+    for date in [
+        &kr.today.date,
+        &kr.previous_business_day.date,
+        &kr.next_business_day.date,
+        &us.today.date,
+        &us.previous_business_day.date,
+        &us.next_business_day.date,
+    ] {
+        validate_calendar_date(date)?;
+    }
+    let mut kr_sessions = Vec::new();
+    if let Some(integrated) = kr.today.integrated {
+        for session in [
+            normalize_calendar_session("preMarket", integrated.pre_market)?,
+            normalize_calendar_session("regularMarket", integrated.regular_market)?,
+            normalize_calendar_session("afterMarket", integrated.after_market)?,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            kr_sessions.push(session);
+        }
+    }
+    let mut us_sessions = Vec::new();
+    for session in [
+        normalize_calendar_session("dayMarket", us.today.day_market)?,
+        normalize_calendar_session("preMarket", us.today.pre_market)?,
+        normalize_calendar_session("regularMarket", us.today.regular_market)?,
+        normalize_calendar_session("afterMarket", us.today.after_market)?,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        us_sessions.push(session);
+    }
+    Ok(TossMarketCalendars {
+        fetched_at_ms,
+        calendars: vec![
+            NormalizedMarketCalendar {
+                market: "KR".to_owned(),
+                provider: "TOSS".to_owned(),
+                fetched_at_ms,
+                date: kr.today.date,
+                holiday: kr_sessions.is_empty(),
+                previous_business_day: kr.previous_business_day.date,
+                next_business_day: kr.next_business_day.date,
+                sessions: kr_sessions,
+            },
+            NormalizedMarketCalendar {
+                market: "US".to_owned(),
+                provider: "TOSS".to_owned(),
+                fetched_at_ms,
+                date: us.today.date,
+                holiday: us_sessions.is_empty(),
+                previous_business_day: us.previous_business_day.date,
+                next_business_day: us.next_business_day.date,
+                sessions: us_sessions,
+            },
+        ],
     })
 }
 
@@ -1706,6 +2087,18 @@ pub async fn market_indices_snapshot(
         }
         Err(error) => Ok(bridge.fallback_snapshot(&error)),
     }
+}
+
+#[tauri::command]
+pub async fn toss_market_calendars(
+    bridge: State<'_, MarketDataBridge>,
+) -> Result<TossMarketCalendars, String> {
+    let credentials = load_credentials()?
+        .ok_or_else(|| "토스증권 Open API 연결 정보를 먼저 등록해 주세요.".to_owned())?;
+    bridge
+        .fetch_market_calendars_with_credentials(&credentials)
+        .await
+        .map_err(|error| error.message.to_owned())
 }
 
 #[tauri::command]
@@ -1894,11 +2287,32 @@ fn resolve_stock_from_text(stocks: &[StockSearchResult], query: &str) -> Option<
     matches.first().map(|(_, stock)| (*stock).clone())
 }
 
+fn explicit_kr_stock_from_text(query: &str) -> Option<StockSearchResult> {
+    let trimmed = query.trim();
+    let explicit_symbol = if trimmed.len() == 6 && trimmed.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        Some(trimmed)
+    } else {
+        query.split('(').skip(1).find_map(|suffix| {
+            let candidate = suffix.split_once(')')?.0.trim();
+            (candidate.len() == 6 && candidate.bytes().all(|byte| byte.is_ascii_digit()))
+                .then_some(candidate)
+        })
+    }?;
+    Some(StockSearchResult {
+        symbol: explicit_symbol.to_owned(),
+        name: explicit_symbol.to_owned(),
+        market: "KRX".to_owned(),
+        currency: "KRW".to_owned(),
+        security_type: "STOCK".to_owned(),
+    })
+}
+
 fn average(values: &[f64]) -> Option<f64> {
     (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
 }
 
-fn analysis_indicators(bars: &[TossChartBar]) -> AnalysisIndicatorSnapshot {
+pub(crate) fn analysis_indicators(bars: &[TossChartBar]) -> AnalysisIndicatorSnapshot {
     let closes: Vec<f64> = bars.iter().map(|bar| bar.close_minor as f64).collect();
     let sma = |period: usize| {
         closes
@@ -1966,6 +2380,69 @@ fn analysis_indicators(bars: &[TossChartBar]) -> AnalysisIndicatorSnapshot {
     }
 }
 
+pub(crate) fn public_market_analysis_snapshot(
+    provider: &'static str,
+    symbol: String,
+    name: String,
+    market: String,
+    asset_class: &str,
+    currency: String,
+    interval: String,
+    fetched_at_ms: u64,
+    bars: Vec<TossChartBar>,
+    mut missing_data: Vec<String>,
+) -> Result<AnalysisSnapshot, String> {
+    let completed_bars: Vec<TossChartBar> = bars.into_iter().filter(|bar| bar.completed).collect();
+    let latest = completed_bars
+        .last()
+        .ok_or_else(|| "완료된 봉이 없어 분석 스냅샷을 만들 수 없습니다.".to_owned())?;
+    if completed_bars.len() < 20 {
+        return Err("분석 스냅샷에는 완료된 봉이 최소 20개 필요합니다.".to_owned());
+    }
+    let latest_close_minor = latest.close_minor;
+    let latest_volume = latest.volume;
+    missing_data.extend([
+        "공식 재무 공급자 미연결".to_owned(),
+        "공식 공시 공급자 미연결".to_owned(),
+        "뉴스 공급자 미연결".to_owned(),
+        "수급·거시 공급자 미연결".to_owned(),
+    ]);
+    Ok(AnalysisSnapshot {
+        snapshot_id: format!(
+            "{}-{}-{}",
+            provider.to_ascii_lowercase(),
+            symbol,
+            fetched_at_ms
+        ),
+        provider,
+        symbol,
+        name,
+        market,
+        currency,
+        as_of_ms: fetched_at_ms,
+        fetched_at_ms,
+        interval,
+        asset_class: asset_class.to_owned(),
+        adjusted: false,
+        completed_bar_count: completed_bars.len(),
+        latest_close_minor,
+        latest_volume,
+        indicators: analysis_indicators(&completed_bars),
+        fundamentals: None,
+        filings: None,
+        availability: AnalysisDataAvailability {
+            price: "available".to_owned(),
+            technical: "available".to_owned(),
+            fundamentals: "provider_not_connected".to_owned(),
+            filings: "provider_not_connected".to_owned(),
+            news: "provider_not_connected".to_owned(),
+            macro_supply: "provider_not_connected".to_owned(),
+        },
+        missing_data,
+        bars: completed_bars,
+    })
+}
+
 #[tauri::command]
 pub async fn toss_analysis_snapshot(
     request: AnalysisSnapshotRequest,
@@ -1981,14 +2458,18 @@ pub async fn toss_analysis_snapshot(
     }
     let credentials = load_credentials()?
         .ok_or_else(|| "토스증권 Open API 연결 정보를 먼저 등록해 주세요.".to_owned())?;
-    let mut candidates = Vec::new();
-    for market in ["kr", "us"] {
-        let stocks = bridge
-            .load_stock_catalog(&credentials, market)
-            .await
-            .map_err(|error| error.message.to_owned())?;
-        if let Some(stock) = resolve_stock_from_text(&stocks, query) {
-            candidates.push(stock);
+    let mut candidates = explicit_kr_stock_from_text(query)
+        .into_iter()
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        for market in ["kr", "us"] {
+            let stocks = bridge
+                .load_stock_catalog(&credentials, market)
+                .await
+                .map_err(|error| error.message.to_owned())?;
+            if let Some(stock) = resolve_stock_from_text(&stocks, query) {
+                candidates.push(stock);
+            }
         }
     }
     if candidates.is_empty() {
@@ -2101,7 +2582,8 @@ pub async fn toss_analysis_snapshot(
         currency,
         as_of_ms,
         fetched_at_ms,
-        interval: "1d",
+        interval: "1d".to_owned(),
+        asset_class: "equity".to_owned(),
         adjusted: true,
         completed_bar_count: completed_bars.len(),
         latest_close_minor,
@@ -2164,8 +2646,15 @@ pub async fn toss_execute_paper_market_order(
     {
         return Err("유효한 종목 코드와 1주 이상의 모의주문 수량이 필요합니다.".to_owned());
     }
+    if !matches!(request.expected_currency.as_str(), "KRW" | "USD") {
+        return Err("국장·미장 시장가 주문 통화를 확인해 주세요.".to_owned());
+    }
     let credentials = load_credentials()?
         .ok_or_else(|| "토스증권 Open API 연결 정보를 먼저 등록해 주세요.".to_owned())?;
+    let calendars = bridge
+        .fetch_market_calendars_with_credentials(&credentials)
+        .await
+        .map_err(|error| error.message.to_owned())?;
     let prices = bridge
         .fetch_prices_with_credentials(&credentials, &symbol)
         .await
@@ -2182,6 +2671,7 @@ pub async fn toss_execute_paper_market_order(
     let reference_price_minor = parse_price_minor(&price.last_price, &price.currency)
         .ok_or_else(|| "토스증권 현재가를 해석하지 못했습니다.".to_owned())?;
     let occurred_at_ms = paper_trading::now_ms()?;
+    ensure_regular_market_session(&calendars, &request.expected_currency, occurred_at_ms)?;
     let account = paper_trading::load_or_open_account_for_currency(&persistence, &price.currency)?;
     let mut ledger =
         persistence.paper_ledger(paper_trading::ledger_id_for_currency(&price.currency)?)?;
@@ -2215,7 +2705,7 @@ pub async fn toss_run_research_backtest(
 }
 
 async fn run_research_backtest(
-    request: TossBacktestRequest,
+    mut request: TossBacktestRequest,
     bridge: &MarketDataBridge,
     persistence: &PersistenceBridge,
     classification: &str,
@@ -2249,6 +2739,22 @@ async fn run_research_backtest(
         .try_into()
         .map_err(|_| "현재 시각이 지원 범위를 초과했습니다.".to_owned())?;
     let bars = price_bars_from_candles(&spec.symbol, request.interval, candles, ingested_at_ms)?;
+    let used_automatic_position_sizing = request.config.order_quantity == 0;
+    if used_automatic_position_sizing {
+        let first_open = bars
+            .first()
+            .map(|bar| bar.open_minor)
+            .filter(|value| *value > 0)
+            .ok_or_else(|| "자동 주문 수량을 계산할 첫 시가가 없습니다.".to_owned())?;
+        let target_notional = request.config.initial_cash_minor / 5;
+        let scaled_quantity = u128::from(target_notional)
+            .checked_mul(u128::from(request.config.quantity_scale))
+            .ok_or_else(|| "자동 주문 수량 계산이 지원 범위를 초과했습니다.".to_owned())?
+            / u128::from(first_open);
+        request.config.order_quantity = u64::try_from(scaled_quantity)
+            .map_err(|_| "자동 주문 수량 계산이 지원 범위를 초과했습니다.".to_owned())?
+            .max(1);
+    }
     let result = run_backtest(spec, &bars, &request.config)
         .map_err(|error| format!("백테스트를 실행하지 못했습니다: {}", error.message))?;
     let costs = request.config.costs;
@@ -2256,6 +2762,18 @@ async fn run_research_backtest(
         "최대 200개 최신 캔들만 사용하는 탐색 백테스트이며 성과 합격 판정은 하지 않습니다."
             .to_owned(),
     ];
+    if used_automatic_position_sizing {
+        warnings.push(format!(
+            "자동 연구 실행은 첫 시가 기준 초기 예수금의 20% 이내인 {}주로 고정 수량을 산정했습니다.",
+            request.config.order_quantity
+        ));
+    }
+    if matches!(request.interval, CandleInterval::OneMinute) {
+        warnings.push(
+            "1분봉 200개는 약 3시간 20분의 짧은 구간이므로 강건성·승격 근거로 사용할 수 없습니다."
+                .to_owned(),
+        );
+    }
     if costs.buy_fee_bps == 0.0
         && costs.sell_fee_bps == 0.0
         && costs.sell_tax_bps == 0.0
@@ -2313,6 +2831,14 @@ mod tests {
     #[test]
     #[ignore = "연결된 토스증권 자격정보와 외부 네트워크를 사용하는 명시적 통합 검사"]
     fn live_toss_smoke_backtest_uses_real_daily_candles() {
+        let symbol =
+            env::var("INVESTA_LIVE_BACKTEST_SYMBOL").unwrap_or_else(|_| "005930".to_owned());
+        let use_kr_costs =
+            env::var("INVESTA_LIVE_BACKTEST_USE_KR_COSTS").is_ok_and(|value| value == "1");
+        let order_quantity = env::var("INVESTA_LIVE_BACKTEST_ORDER_QUANTITY")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(1);
         let run_id: u64 = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("current time")
@@ -2344,7 +2870,7 @@ mod tests {
                 strategy_id: "system-smoke-ma-5-20".to_owned(),
                 name: "시스템 연결 확인용 5/20 이동평균 교차".to_owned(),
                 market: Market::Korea,
-                symbol: "005930".to_owned(),
+                symbol: symbol.clone(),
                 currency: "KRW".to_owned(),
                 hypothesis: "고정된 이동평균 규칙으로 데이터 수집·신호·체결·성과 계산의 연결만 확인한다.".to_owned(),
                 source_evidence_ids: vec!["toss-api-docs".to_owned()],
@@ -2359,7 +2885,13 @@ mod tests {
                     direction: CrossDirection::Below,
                 },
                 limitations: vec![
-                    "최신 200개 일봉, 1주, 거래비용 0bp를 사용하는 시스템 연결 검사다.".to_owned(),
+                    if use_kr_costs {
+                        "최신 200개 일봉, 1주, 국내주식 기본 비용 프리셋을 사용하는 시스템 연결 검사다."
+                            .to_owned()
+                    } else {
+                        "최신 200개 일봉, 1주, 거래비용 0bp를 사용하는 시스템 연결 검사다."
+                            .to_owned()
+                    },
                     "수익률이나 승률을 투자전략 채택 기준으로 사용하지 않는다.".to_owned(),
                 ],
                 unknowns: vec![],
@@ -2373,17 +2905,26 @@ mod tests {
             adjusted: true,
             config: BacktestConfig {
                 experiment_id: format!("system-smoke-{run_id}"),
-                dataset_id: format!("toss-005930-adjusted-{run_id}"),
+                dataset_id: format!("toss-{symbol}-adjusted-{run_id}"),
                 code_version: env!("CARGO_PKG_VERSION").to_owned(),
                 initial_cash_minor: 100_000_000,
-                order_quantity: 1,
+                order_quantity,
                 quantity_scale: 1,
                 close_open_position_at_end: true,
-                costs: TradingCosts {
-                    buy_fee_bps: 0.0,
-                    sell_fee_bps: 0.0,
-                    sell_tax_bps: 0.0,
-                    slippage_bps: 0.0,
+                costs: if use_kr_costs {
+                    TradingCosts {
+                        buy_fee_bps: 1.5,
+                        sell_fee_bps: 1.5,
+                        sell_tax_bps: 20.0,
+                        slippage_bps: 0.0,
+                    }
+                } else {
+                    TradingCosts {
+                        buy_fee_bps: 0.0,
+                        sell_fee_bps: 0.0,
+                        sell_tax_bps: 0.0,
+                        slippage_bps: 0.0,
+                    }
                 },
                 risk_limits: None,
             },
@@ -2404,10 +2945,53 @@ mod tests {
             result.result.completed_trade_count,
             result.result.win_rate_bps
         );
+        if order_quantity == 0 {
+            assert!(result.result.fills.iter().all(|fill| fill.quantity > 1));
+            assert!(result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("초기 예수금의 20%")));
+        }
         drop(persistence);
         if record_database.is_none() {
             let _ = fs::remove_file(database_path);
         }
+    }
+
+    #[test]
+    #[ignore = "연결된 토스증권 자격정보와 외부 계좌 서버를 사용하는 명시적 읽기 전용 검사"]
+    fn live_toss_account_snapshot_is_read_only_and_masked() {
+        let credentials = load_credentials()
+            .expect("credential store")
+            .expect("stored Toss credentials");
+        let accounts = tauri::async_runtime::block_on(
+            MarketDataBridge::default().fetch_account_snapshot_with_credentials(&credentials),
+        )
+        .expect("Toss read-only account snapshot");
+        assert!(accounts
+            .iter()
+            .all(|account| account.masked_account_no.contains('*')));
+    }
+
+    #[test]
+    #[ignore = "연결된 토스증권 자격정보와 외부 장 캘린더 서버를 사용하는 명시적 읽기 전용 검사"]
+    fn live_toss_market_calendars_use_official_sessions() {
+        let credentials = load_credentials()
+            .expect("credential store")
+            .expect("stored Toss credentials");
+        let calendars = tauri::async_runtime::block_on(
+            MarketDataBridge::default().fetch_market_calendars_with_credentials(&credentials),
+        )
+        .expect("Toss market calendars");
+        assert_eq!(calendars.calendars.len(), 2);
+        assert!(calendars
+            .calendars
+            .iter()
+            .all(|calendar| calendar.provider == "TOSS"));
+        assert!(calendars
+            .calendars
+            .iter()
+            .all(|calendar| calendar.holiday || !calendar.sessions.is_empty()));
     }
 
     #[test]
@@ -2429,6 +3013,121 @@ mod tests {
         assert_eq!(snapshot.quotes[1].value, Some(845.32));
         assert_eq!(snapshot.quotes[0].change_percent, None);
         assert_eq!(snapshot.quotes[2].value, None);
+    }
+
+    #[test]
+    fn official_market_calendar_preserves_holiday_and_overnight_sessions() {
+        let session = |start: &str, end: &str| {
+            Some(MarketSessionTime {
+                start_time: start.to_owned(),
+                end_time: end.to_owned(),
+            })
+        };
+        let kr = KrMarketCalendarResponse {
+            today: KrMarketDay {
+                date: "2026-05-05".to_owned(),
+                integrated: None,
+            },
+            previous_business_day: KrMarketDay {
+                date: "2026-05-04".to_owned(),
+                integrated: None,
+            },
+            next_business_day: KrMarketDay {
+                date: "2026-05-06".to_owned(),
+                integrated: None,
+            },
+        };
+        let us = UsMarketCalendarResponse {
+            today: UsMarketDay {
+                date: "2026-03-25".to_owned(),
+                day_market: None,
+                pre_market: None,
+                regular_market: session("2026-03-25T22:30:00+09:00", "2026-03-26T05:00:00+09:00"),
+                after_market: None,
+            },
+            previous_business_day: UsMarketDay {
+                date: "2026-03-24".to_owned(),
+                day_market: None,
+                pre_market: None,
+                regular_market: None,
+                after_market: None,
+            },
+            next_business_day: UsMarketDay {
+                date: "2026-03-26".to_owned(),
+                day_market: None,
+                pre_market: None,
+                regular_market: None,
+                after_market: None,
+            },
+        };
+        let normalized = normalize_market_calendars(kr, us, 123).expect("official calendar");
+        assert!(normalized.calendars[0].holiday);
+        assert!(!normalized.calendars[1].holiday);
+        assert_eq!(normalized.calendars[1].sessions[0].name, "regularMarket");
+        assert_eq!(
+            normalized.calendars[1].sessions[0].end_time,
+            "2026-03-26T05:00:00+09:00"
+        );
+    }
+
+    #[test]
+    fn market_calendar_rejects_malformed_dates_and_session_times() {
+        assert_eq!(
+            parse_official_session_timestamp_ms("1970-01-01T09:00:00+09:00").unwrap(),
+            0
+        );
+        assert_eq!(
+            parse_official_session_timestamp_ms("1970-01-01T00:00:00Z").unwrap(),
+            0
+        );
+        assert!(validate_calendar_date("2026/03/25").is_err());
+        assert!(parse_official_session_timestamp_ms("2026-02-30T09:00:00+09:00").is_err());
+        assert!(normalize_calendar_session(
+            "regularMarket",
+            Some(MarketSessionTime {
+                start_time: "2026-03-25T15:30:00+09:00".to_owned(),
+                end_time: "2026-03-25T09:00:00+09:00".to_owned(),
+            })
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn stock_paper_market_order_gate_allows_only_fresh_regular_session() {
+        let session = NormalizedMarketSession {
+            name: "regularMarket".to_owned(),
+            start_time: "2026-08-27T09:00:00+09:00".to_owned(),
+            end_time: "2026-08-27T15:30:00+09:00".to_owned(),
+        };
+        let now = parse_official_session_timestamp_ms("2026-08-27T10:00:00+09:00").unwrap();
+        let calendars = TossMarketCalendars {
+            fetched_at_ms: now,
+            calendars: vec![NormalizedMarketCalendar {
+                market: "KR".to_owned(),
+                provider: "TOSS".to_owned(),
+                fetched_at_ms: now,
+                date: "2026-08-27".to_owned(),
+                holiday: false,
+                previous_business_day: "2026-08-26".to_owned(),
+                next_business_day: "2026-08-28".to_owned(),
+                sessions: vec![session],
+            }],
+        };
+        assert!(ensure_regular_market_session(&calendars, "KRW", now).is_ok());
+        assert!(ensure_regular_market_session(
+            &calendars,
+            "KRW",
+            parse_official_session_timestamp_ms("2026-08-27T16:00:00+09:00").unwrap()
+        )
+        .is_err());
+
+        let mut holiday = calendars.clone();
+        holiday.calendars[0].holiday = true;
+        assert!(ensure_regular_market_session(&holiday, "KRW", now).is_err());
+
+        let mut stale = calendars;
+        stale.fetched_at_ms = now - 300_001;
+        assert!(ensure_regular_market_session(&stale, "KRW", now).is_err());
     }
 
     #[test]
@@ -2718,6 +3417,16 @@ mod tests {
     }
 
     #[test]
+    fn analysis_request_uses_an_explicit_kr_symbol_without_catalog_lookup() {
+        let stock = explicit_kr_stock_from_text("한화(000880) 보유 포지션을 분석해")
+            .expect("explicit Korean stock symbol");
+        assert_eq!(stock.symbol, "000880");
+        assert_eq!(stock.market, "KRX");
+        assert_eq!(stock.currency, "KRW");
+        assert!(explicit_kr_stock_from_text("현재가 123800원 분석").is_none());
+    }
+
+    #[test]
     fn analysis_indicators_use_only_completed_point_in_time_bars() {
         let bars = (0..80)
             .map(|index| TossChartBar {
@@ -2729,6 +3438,15 @@ mod tests {
                 close_minor: 10_000 + index,
                 volume: 1_000 + index,
                 completed: true,
+                available_at_ms: Some((index + 1) * 86_400_000),
+                ingested_at_ms: Some(81 * 86_400_000),
+                session_id: None,
+                contract_code: None,
+                settlement_price_minor: None,
+                mark_price_minor: None,
+                index_price_minor: None,
+                funding_rate_bps: None,
+                funding_time_ms: None,
             })
             .collect::<Vec<_>>();
         let indicators = analysis_indicators(&bars);

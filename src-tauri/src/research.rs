@@ -51,6 +51,21 @@ pub enum SignalSpec {
         slow_window: usize,
         direction: CrossDirection,
     },
+    PriceChannelBreakout {
+        lookback: usize,
+        direction: CrossDirection,
+    },
+    MeanReversion {
+        window: usize,
+        deviation_bps: u64,
+        direction: CrossDirection,
+    },
+    VolatilityExpansion {
+        atr_window: usize,
+        breakout_window: usize,
+        minimum_expansion_bps: u64,
+        direction: CrossDirection,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -152,7 +167,7 @@ fn validate_signal(
     expected_direction: CrossDirection,
     issues: &mut Vec<ResearchIssue>,
 ) {
-    match signal {
+    let valid = match signal {
         SignalSpec::MovingAverageCross {
             fast_window,
             slow_window,
@@ -160,13 +175,58 @@ fn validate_signal(
         } if *fast_window > 0
             && *slow_window > *fast_window
             && *slow_window <= 10_000
-            && *direction == expected_direction => {}
-        _ => issue(
+            && *direction == expected_direction =>
+        {
+            true
+        }
+        SignalSpec::PriceChannelBreakout {
+            lookback,
+            direction,
+        } if (2..=10_000).contains(lookback) && *direction == expected_direction => true,
+        SignalSpec::MeanReversion {
+            window,
+            deviation_bps,
+            direction,
+        } if (2..=10_000).contains(window)
+            && (1..10_000).contains(deviation_bps)
+            && *direction
+                == match expected_direction {
+                    CrossDirection::Above => CrossDirection::Below,
+                    CrossDirection::Below => CrossDirection::Above,
+                } =>
+        {
+            true
+        }
+        SignalSpec::VolatilityExpansion {
+            atr_window,
+            breakout_window,
+            minimum_expansion_bps,
+            direction,
+        } if (2..=10_000).contains(atr_window)
+            && (2..=10_000).contains(breakout_window)
+            && (1..=100_000).contains(minimum_expansion_bps)
+            && *direction == expected_direction =>
+        {
+            true
+        }
+        _ => false,
+    };
+    if !valid {
+        issue(
             issues,
             ResearchIssueCode::InvalidSignal,
             field,
-            "이동평균 기간은 0보다 크고 fast < slow여야 하며 진입·청산 방향이 명확해야 합니다.",
-        ),
+            "전략 파라미터는 지원 범위 안이어야 하며 플러그인별 진입·청산 방향이 명확해야 합니다.",
+        );
+    }
+}
+
+fn signal_family(signal: &SignalSpec) -> &'static str {
+    match signal {
+        SignalSpec::MovingAverageCross { .. } => "trend.moving_average_cross",
+        SignalSpec::PriceChannelBreakout { .. } => "breakout.price_channel",
+        SignalSpec::MeanReversion { .. } => "mean_reversion.distance_from_mean",
+        SignalSpec::VolatilityExpansion { .. } => "volatility.atr_expansion",
     }
 }
 
@@ -272,6 +332,14 @@ pub fn review_strategy_spec(spec: &StrategySpec) -> StrategyReview {
         CrossDirection::Below,
         &mut issues,
     );
+    if signal_family(&spec.entry_signal) != signal_family(&spec.exit_signal) {
+        issue(
+            &mut issues,
+            ResearchIssueCode::InvalidSignal,
+            "entrySignalOrExitSignal",
+            "진입과 청산 신호는 동일한 버전형 전략 플러그인 계열이어야 합니다.",
+        );
+    }
 
     if !spec.unknowns.is_empty() {
         issue(
@@ -512,5 +580,60 @@ mod tests {
             .issues
             .iter()
             .any(|item| item.code == ResearchIssueCode::MissingEvidence));
+    }
+
+    #[test]
+    fn accepts_each_supported_strategy_plugin_and_rejects_mixed_families() {
+        let signal_pairs = [
+            (
+                SignalSpec::PriceChannelBreakout {
+                    lookback: 20,
+                    direction: CrossDirection::Above,
+                },
+                SignalSpec::PriceChannelBreakout {
+                    lookback: 20,
+                    direction: CrossDirection::Below,
+                },
+            ),
+            (
+                SignalSpec::MeanReversion {
+                    window: 20,
+                    deviation_bps: 200,
+                    direction: CrossDirection::Below,
+                },
+                SignalSpec::MeanReversion {
+                    window: 20,
+                    deviation_bps: 200,
+                    direction: CrossDirection::Above,
+                },
+            ),
+            (
+                SignalSpec::VolatilityExpansion {
+                    atr_window: 14,
+                    breakout_window: 20,
+                    minimum_expansion_bps: 12_500,
+                    direction: CrossDirection::Above,
+                },
+                SignalSpec::VolatilityExpansion {
+                    atr_window: 14,
+                    breakout_window: 20,
+                    minimum_expansion_bps: 12_500,
+                    direction: CrossDirection::Below,
+                },
+            ),
+        ];
+        for (entry, exit) in signal_pairs {
+            let mut report = valid_report();
+            report.strategy_candidate.entry_signal = entry;
+            report.strategy_candidate.exit_signal = exit;
+            assert!(review_research_report(&report).executable);
+        }
+
+        let mut mixed = valid_report();
+        mixed.strategy_candidate.entry_signal = SignalSpec::PriceChannelBreakout {
+            lookback: 20,
+            direction: CrossDirection::Above,
+        };
+        assert!(!review_research_report(&mixed).executable);
     }
 }
