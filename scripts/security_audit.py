@@ -20,12 +20,21 @@ PATTERNS = {
 }
 
 
+def configure_utf8_console() -> None:
+    """Keep Korean audit output deterministic on Windows CI consoles."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+
+
 def git(*args: str) -> bytes:
     result = subprocess.run(["git", *args], cwd=ROOT, check=True, capture_output=True)
     return result.stdout
 
 
 def main() -> int:
+    configure_utf8_console()
     tracked = [Path(line) for line in git("ls-files", "--cached", "--others", "--exclude-standard", "-z").decode("utf-8").split("\0") if line]
     failures: list[str] = []
     for relative in tracked:
