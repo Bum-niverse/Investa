@@ -90,6 +90,8 @@ pnpm install
 pnpm tauri dev
 ```
 
+바탕화면 `Investa` 바로가기는 [`scripts/launch_investa.ps1`](scripts/launch_investa.ps1)을 사용합니다. release가 현재 소스보다 오래된 경우에만 설치 패키지 생성 없이 증분 빌드한 뒤 실행하며, 자세한 동작과 오류 로그 위치는 [데스크톱 런처](docs/desktop-launcher.md)에 정리했습니다.
+
 브라우저 UI만 확인하려면 `pnpm dev`를 실행합니다.
 
 ## 검증
