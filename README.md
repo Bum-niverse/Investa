@@ -1,6 +1,6 @@
 # Investa
 
-![Investa 로컬 투자본부 로그인과 보안 경계](docs/assets/investa-overview.gif)
+![Investa 사옥·분석·통합 모의투자·append-only 원장 미리보기](docs/assets/investa-overview.gif)
 
 한국·미국 주식과 암호화폐를 여러 전문 에이전트가 분석하고, 결정론적 위험 게이트를 통과한 거래안만 모의투자로 검증하는 로컬 우선 데스크톱 프로그램입니다. Windows 개발 빌드가 현재 기준이며 macOS는 [수동 호환성 검증 기반](docs/macos-compatibility.md)까지 준비돼 있습니다.
 
