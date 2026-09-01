@@ -28,7 +28,7 @@ serde_json = "1"
 reqwest = { version = "0.13.4", default-features = false, features = ["native-tls-no-alpn", "json", "form", "query"] }
 keyring = { version = "4.1.6", default-features = false, features = ["v1", "windows-native-keyring-store"] }
 rusqlite = { version = "0.40.2", features = ["bundled", "fallible_uint"] }
-base64 = "0.22"
+base64 = "0.23"
 hmac = "0.12"
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
