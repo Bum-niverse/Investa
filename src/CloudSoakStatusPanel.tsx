@@ -6,7 +6,7 @@ type CloudSoakJob = {
   mode: "market" | "shadow-contract";
   jobName: string;
   executionName?: string | null;
-  state: "unavailable" | "running" | "failed" | "completed";
+  state: "unavailable" | "running" | "cancelled" | "failed" | "completed";
   startedAtMs?: number | null;
   completedAtMs?: number | null;
   elapsedMs?: number | null;
@@ -29,6 +29,7 @@ const duration = (value?: number | null) => {
   return `${hours}시간 ${minutes}분`;
 };
 const statusLabel = { unavailable: "수집 전", running: "검사 진행 중", warning: "경고 확인 필요", failed: "검사 실패", completed: "24시간 검사 통과" } as const;
+const jobStateLabel = { unavailable: "수집 전", running: "진행 중", cancelled: "조기 종료", failed: "실패", completed: "완료" } as const;
 
 export function CloudSoakStatusPanel() {
   const [snapshot, setSnapshot] = useState<CloudSoakSnapshot>();
@@ -59,7 +60,7 @@ export function CloudSoakStatusPanel() {
     {snapshot?.issue ? <small>{snapshot.issue}</small> : null}
     {error ? <small className="settings-error" role="alert">{error}</small> : null}
     {report?.jobs.map((job) => <section className="readiness-row" key={`${job.jobName}-${job.executionName ?? "none"}`}>
-      <b>{job.mode === "market" ? "실시간 시세 스트림" : "내부 섀도우 원장"} · {job.state}</b>
+      <b>{job.mode === "market" ? "실시간 시세 스트림" : "내부 섀도우 원장"} · {jobStateLabel[job.state]}</b>
       <span>{duration(job.elapsedMs)} · 24시간 실측 {job.actualElapsed24hQualified ? "적격" : "미충족"}</span>
       <small>시작 {dateTime(job.startedAtMs)} · 최근 heartbeat {dateTime(job.latestHeartbeatAtMs)}</small>
       {job.heartbeat?.streams ? Object.entries(job.heartbeat.streams).map(([streamId, value]) => <small key={streamId}>{streamId}: 메시지 {value.messages} · 재연결 {value.reconnects} · 오류 {value.errors} · 전송 타임아웃 {value.transportTimeouts} · 시세 공백 {value.marketGapEvents}</small>) : null}

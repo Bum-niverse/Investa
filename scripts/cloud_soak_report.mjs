@@ -1,15 +1,17 @@
 import { execFile } from "node:child_process";
-import { mkdir, rename, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const execFileAsync = promisify(execFile);
 const MAX_COMMAND_OUTPUT_BYTES = 4 * 1024 * 1024;
 const COMMAND_TIMEOUT_MS = 30_000;
+const WINDOWS_GCLOUD_WRAPPER = fileURLToPath(new URL("./invoke_gcloud.ps1", import.meta.url));
 const PROJECT_ID = "investa-remote-bumniverse";
 const REGION = "asia-northeast3";
+const SUPPORTED_LOG_SCHEMAS = new Set(["investa.cloud-soak.v1", "investa.cloud-soak.v2"]);
 const JOBS = [
   { mode: "market", jobName: "investa-market-soak-24h-v2" },
   { mode: "shadow-contract", jobName: "investa-shadow-contract-soak-24h" },
@@ -34,8 +36,104 @@ function conditionState(execution) {
   const conditions = Array.isArray(execution?.status?.conditions) ? execution.status.conditions : [];
   const completed = conditions.find((item) => item?.type === "Completed");
   if (completed?.status === "True") return "completed";
+  if (execution?.status?.cancelledCount > 0 || completed?.reason === "Cancelled") return "cancelled";
   if (completed?.status === "False" && completed?.reason) return "failed";
   return execution?.metadata?.name ? "running" : "unavailable";
+}
+
+function codedError(code, message, cause) {
+  const error = new Error(message, cause ? { cause } : undefined);
+  error.code = code;
+  return error;
+}
+
+function windowsGcloudCandidates(env = process.env) {
+  return [
+    env.LOCALAPPDATA && join(env.LOCALAPPDATA, "Google", "Cloud SDK", "google-cloud-sdk", "bin", "gcloud.cmd"),
+    env.ProgramFiles && join(env.ProgramFiles, "Google", "Cloud SDK", "google-cloud-sdk", "bin", "gcloud.cmd"),
+    env["ProgramFiles(x86)"] && join(env["ProgramFiles(x86)"], "Google", "Cloud SDK", "google-cloud-sdk", "bin", "gcloud.cmd"),
+  ].filter(Boolean);
+}
+
+async function firstAccessible(paths) {
+  for (const path of paths) {
+    try {
+      await access(path);
+      return path;
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+  }
+  return undefined;
+}
+
+async function resolveGcloudExecutable(platform = process.platform, env = process.env) {
+  if (env.GCLOUD_BIN) {
+    if (!isAbsolute(env.GCLOUD_BIN)) {
+      throw codedError("GCLOUD_BIN_INVALID", "GCLOUD_BIN은 절대 경로여야 합니다.");
+    }
+    const configured = await firstAccessible([env.GCLOUD_BIN]);
+    if (!configured) throw codedError("GCLOUD_NOT_FOUND", "GCLOUD_BIN 경로에서 Google Cloud CLI를 찾지 못했습니다.");
+    return configured;
+  }
+  if (platform !== "win32") return "gcloud";
+
+  const wherePath = join(env.SystemRoot || "C:\\Windows", "System32", "where.exe");
+  try {
+    const { stdout } = await execFileAsync(wherePath, ["gcloud.cmd"], {
+      encoding: "utf8",
+      timeout: 5_000,
+      maxBuffer: 64 * 1024,
+      windowsHide: true,
+    });
+    const resolved = stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+    if (resolved && isAbsolute(resolved)) return resolved;
+  } catch (error) {
+    if (error?.code !== 1 && error?.code !== "ENOENT") throw error;
+  }
+  const candidate = await firstAccessible(windowsGcloudCandidates(env));
+  if (candidate) return candidate;
+  throw codedError("GCLOUD_NOT_FOUND", "Google Cloud CLI를 찾지 못했습니다.");
+}
+
+function validateGcloudArgument(value) {
+  if (typeof value !== "string" || value.length > 8_192 || /[\0\r\n]/u.test(value)) {
+    throw codedError("GCLOUD_ARGUMENT_INVALID", "Cloud CLI 인자에 허용되지 않은 문자가 있습니다.");
+  }
+  return value;
+}
+
+export function buildWindowsGcloudInvocation(executable, args, env = process.env) {
+  if (!isAbsolute(executable) || !/\.(?:cmd|bat|exe)$/iu.test(executable)) {
+    throw codedError("GCLOUD_BIN_INVALID", "Windows Cloud CLI는 확인된 절대 경로만 실행할 수 있습니다.");
+  }
+  const powershell = join(
+    env.SystemRoot || "C:\\Windows",
+    "System32", "WindowsPowerShell", "v1.0", "powershell.exe",
+  );
+  return {
+    file: powershell,
+    args: [
+      "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+      "-File", WINDOWS_GCLOUD_WRAPPER, executable, ...args.map(validateGcloudArgument),
+    ],
+  };
+}
+
+export function classifyGcloudError(error) {
+  const code = typeof error?.code === "string" ? error.code : undefined;
+  if (code === "GCLOUD_NOT_FOUND" || code === "ENOENT") return "Google Cloud CLI를 찾지 못했습니다.";
+  if (code === "GCLOUD_BIN_INVALID" || code === "GCLOUD_ARGUMENT_INVALID") return "Google Cloud CLI 실행 설정이 안전하지 않습니다.";
+  if (code === "ETIMEDOUT") return "Google Cloud CLI 조회 시간이 초과됐습니다.";
+  const stderr = typeof error?.stderr === "string" ? error.stderr.toLowerCase() : "";
+  if (/login|logged in|credential|reauth|authentication|account/u.test(stderr)) {
+    return "Google Cloud CLI 로그인이 필요합니다.";
+  }
+  if (/permission|denied|forbidden|does not have/u.test(stderr)) {
+    return "Cloud Run 또는 Logging 읽기 권한이 없습니다.";
+  }
+  if (code === "GCLOUD_OUTPUT_INVALID") return "Google Cloud CLI 응답 형식이 올바르지 않습니다.";
+  return `Cloud Run 조회 실패 (${code || "GCLOUD_READ_FAILED"})`;
 }
 
 export function summarizeExecution(definition, execution, logEntries, collectedAtMs = Date.now()) {
@@ -44,7 +142,7 @@ export function summarizeExecution(definition, execution, logEntries, collectedA
   const completedAtMs = timestampMs(execution?.status?.completionTime);
   const payloads = (Array.isArray(logEntries) ? logEntries : [])
     .map((entry) => ({ payload: asObject(entry?.jsonPayload), observedAtMs: timestampMs(entry?.timestamp) }))
-    .filter(({ payload }) => payload.schema === "investa.cloud-soak.v2" && payload.mode === definition.mode)
+    .filter(({ payload }) => SUPPORTED_LOG_SCHEMAS.has(payload.schema) && payload.mode === definition.mode)
     .sort((left, right) => (left.observedAtMs ?? 0) - (right.observedAtMs ?? 0));
   const completed = [...payloads].reverse().find(({ payload }) => payload.event === "completed");
   const heartbeat = [...payloads].reverse().find(({ payload }) => payload.event === "heartbeat") ?? completed;
@@ -104,19 +202,27 @@ export function evaluateReport(jobs) {
   if (!jobs.length || jobs.every((job) => job.state === "unavailable")) return "unavailable";
   if (jobs.some((job) => job.state === "failed" || job.passed === false || job.issues.length > 0)) return "failed";
   if (jobs.every((job) => job.state === "completed" && job.actualElapsed24hQualified && job.passed === true)) return "completed";
-  if (jobs.some((job) => job.warnings.length > 0 || job.collectionIssue)) return "warning";
+  if (jobs.some((job) => job.state === "cancelled" || job.warnings.length > 0 || job.collectionIssue)) return "warning";
   return "running";
 }
 
 async function runGcloud(args) {
-  const executable = process.env.GCLOUD_BIN || (process.platform === "win32" ? "gcloud.cmd" : "gcloud");
-  const { stdout } = await execFileAsync(executable, args, {
+  const executable = await resolveGcloudExecutable();
+  const options = {
     encoding: "utf8",
     timeout: COMMAND_TIMEOUT_MS,
     maxBuffer: MAX_COMMAND_OUTPUT_BYTES,
     windowsHide: true,
-  });
-  return JSON.parse(stdout || "[]");
+  };
+  const invocation = process.platform === "win32"
+    ? buildWindowsGcloudInvocation(executable, args)
+    : { file: executable, args };
+  const { stdout } = await execFileAsync(invocation.file, invocation.args, options);
+  try {
+    return JSON.parse(stdout || "[]");
+  } catch (error) {
+    throw codedError("GCLOUD_OUTPUT_INVALID", "Google Cloud CLI가 JSON이 아닌 응답을 반환했습니다.", error);
+  }
 }
 
 async function collectJob(definition, collectedAtMs) {
@@ -133,17 +239,19 @@ async function collectJob(definition, collectedAtMs) {
     const executionName = execution.metadata.name;
     const logs = await runGcloud([
       "logging", "read",
-      `resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"${definition.jobName}\" AND labels.\"run.googleapis.com/execution_name\"=\"${executionName}\" AND jsonPayload.schema=\"investa.cloud-soak.v2\" AND (jsonPayload.event=\"heartbeat\" OR jsonPayload.event=\"completed\")`,
-      `--project=${PROJECT_ID}`, "--freshness=2d", "--limit=1600", "--order=asc", "--format=json",
+      `resource.type="cloud_run_job" AND resource.labels.job_name="${definition.jobName}" AND (jsonPayload.schema="investa.cloud-soak.v1" OR jsonPayload.schema="investa.cloud-soak.v2") AND (jsonPayload.event="heartbeat" OR jsonPayload.event="completed")`,
+      `--project=${PROJECT_ID}`, "--freshness=2d", "--limit=1600", "--order=desc", "--format=json",
     ]);
-    const summary = summarizeExecution(definition, execution, logs, collectedAtMs);
+    const executionLogs = Array.isArray(logs)
+      ? logs.filter((entry) => asObject(entry?.labels)["run.googleapis.com/execution_name"] === executionName)
+      : [];
+    const summary = summarizeExecution(definition, execution, executionLogs, collectedAtMs);
     return summary.latestHeartbeatAtMs
       ? summary
-      : { ...summary, collectionIssue: "v2 heartbeat 또는 완료 로그를 찾지 못했습니다." };
+      : { ...summary, collectionIssue: "지원하는 heartbeat 또는 완료 로그를 찾지 못했습니다." };
   } catch (error) {
     const unavailable = summarizeExecution(definition, {}, [], collectedAtMs);
-    const code = typeof error?.code === "string" ? error.code : "GCLOUD_READ_FAILED";
-    return { ...unavailable, collectionIssue: `Cloud Run 조회 실패 (${code})` };
+    return { ...unavailable, collectionIssue: classifyGcloudError(error) };
   }
 }
 

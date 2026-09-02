@@ -322,6 +322,21 @@ Amazon Chronos와 Google TimesFM은 Apache-2.0의 유명 시계열 모델 후보
 - 적용: 수집기는 최신 실행의 heartbeat·완료 이벤트를 허용 목록으로 축약해 임시 파일과 이전 캐시 복구가 가능한 방식으로 교체 저장한다. 운영 화면은 진행·경고·실패·24시간 통과를 텍스트와 색상으로 함께 표시한다. `pnpm desktop:start`는 기존 증분 release 런처, `pnpm desktop:check`는 비실행 진단 경로다.
 - 검증: 구조화 로그 축약에서 임의 `token` 필드가 사라지는지, 24시간 미충족·수집 불가·경고·실패를 통과로 오인하지 않는지, Rust가 미지 필드·실주문 허용 캐시를 거부하는지, release 경로가 localhost 없이 선택되는지 검사한다.
 
+### Windows Cloud CLI 수집 경로 보강 (2026-09-03)
+
+- 보안 사전 검토: `gcloud` 인자는 고정 project·region·job과 읽기 전용 조회만 허용한다. Windows batch 실행에는 shell이 필요하므로 PATH 또는 공식 기본 설치 경로에서 확인한 절대 `gcloud.cmd`만 고정 PowerShell 래퍼에 인자 배열로 전달하고, 환경변수 override도 존재하는 절대 경로만 허용한다. 명령 문자열을 조립하지 않으며 인자의 NUL·줄바꿈과 과도한 길이를 거부한다. Cloud 응답의 execution name은 shell 필터에 삽입하지 않고 로컬에서 일치 여부를 확인한다. stderr 원문과 OAuth 자격정보는 캐시·UI에 기록하지 않는다.
+- Google 공식 문서: Windows Google Cloud CLI의 공식 설치 경로·PATH 갱신 요구와 Cloud Run job 실행 목록·Cloud Logging 조회 계약을 재확인했다. 앱에 Cloud 인증을 내장하지 않고 외부 CLI 세션을 계속 사용한다.
+  - https://docs.cloud.google.com/sdk/docs/install-sdk
+  - https://docs.cloud.google.com/sdk/gcloud/reference/run/jobs/executions
+  - https://docs.cloud.google.com/run/docs/logging
+- GitHub/upstream: Node.js `child_process` 공식 문서와 upstream 원문은 Windows `.cmd`가 직접 실행 가능한 네이티브 실행 파일이 아니며 shell 경계에서 입력을 정제해야 한다고 설명한다. 별도 패키지나 코드는 도입하지 않고 기존 Node 표준 라이브러리로 독립 구현했다.
+  - https://nodejs.org/api/child_process.html#spawning-bat-and-cmd-files-on-windows
+  - https://github.com/nodejs/node/blob/main/doc/api/child_process.md
+- Kaggle 조사: Kaggle Notebook의 gcloud 연동 안내는 노트북 비밀 저장소와 클라우드 런타임을 전제로 하므로 로컬 Windows 수집기 구현·검증에 적용하지 않았다. 관련 데이터셋이나 Notebook 기반 성능 증거는 적용 가능한 결과 없음이다.
+- 적용·검증: Windows 경로 확인과 안전한 명령 생성, CLI 부재·인증·권한·비정상 JSON 오류 분류를 추가한다. Cloud Logging 조회는 job 단위의 고정 필터로 가져온 뒤 최신 execution label을 로컬에서 재검증한다. 단위 테스트와 실제 수집 재실행으로 기존 `EINVAL`이 구체적인 수집 불가 사유로 바뀌는지 확인한다.
+- 호환성 판정: 이미 완료된 Cloud Run 실행을 재배포하지 않고 검증하기 위해 고정된 `investa.cloud-soak.v1`·`v2` 구조화 스키마만 허용한다. 자유 형식 로그나 알 수 없는 스키마는 성공 근거로 승격하지 않는다.
+- 조기 종료 판정: Cloud Run의 `cancelledCount`와 `Completed=False, reason=Cancelled`는 런타임 오류와 분리한다. 구조화 완료 로그가 통과여도 24시간 실측이 부족하면 종합 경고로 남기고 24시간 완료로 승격하지 않는다.
+
 ## Codex 분석 품질 프로필과 근거 종합 레퍼런스
 
 - OpenAI Codex App Server 공식 문서의 `model/list`와 `turn/start` 계약을 채택한다. 실행 시 계정에 실제로 노출된 모델과 지원 reasoning effort를 조회하고, 분석 유형별 목표 강도가 지원되지 않으면 카탈로그 안에서만 보수적으로 낮춘다. 사용자 전역 설정이나 존재하지 않는 모델·강도를 추측하지 않는다.

@@ -130,7 +130,7 @@ fn validate_cloud_soak_report(report: &CloudSoakReport) -> Result<(), String> {
         if !matches!(job.mode.as_str(), "market" | "shadow-contract")
             || !matches!(
                 job.state.as_str(),
-                "unavailable" | "running" | "failed" | "completed"
+                "unavailable" | "running" | "cancelled" | "failed" | "completed"
             )
             || job.job_name.len() > 128
             || job

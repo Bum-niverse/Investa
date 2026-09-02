@@ -183,6 +183,7 @@ def new_features() -> list[dict[str, Any]]:
                 ("최소 24시간 격리 운용에서 동일 완료봉 후보 중복이 발생하지 않는다.", False),
                 ("공급자 만료·네트워크 오류·앱 재시작에서 신규 진입을 fail-closed로 잠근다.", False),
                 ("메모리·타이머·SQLite 증가량과 복구 시간을 기록해 기준 초과를 경고한다.", False),
+                ("Cloud 격리 원장 계약을 실제 24시간 실행해 사건 1,439건·원장 1,439건·실패 0건과 대사 통과를 확인한다.", False),
             ],
             "amber",
         ),
@@ -332,6 +333,7 @@ PARTIAL_CHECKS: dict[str, set[int]] = {
     "feat-crypto-paper-terminal-provider": {0, 1, 2},
     "feat-forecast-foundation-model-adapters": {1},
     "feat-data-ingestion": {0, 1},
+    "feat-auto-external-soak": {1, 3, 4, 5},
 }
 
 NEW_DONE_ALL = {
@@ -342,7 +344,7 @@ NEW_DONE_ALL = {
 
 NEW_PARTIAL_CHECKS: dict[str, set[int]] = {
     "feat-strategy-protection-operations-visibility": {0, 1, 2},
-    "feat-shadow-long-run-soak": {1, 2},
+    "feat-shadow-long-run-soak": {1, 2, 3},
     "feat-codex-long-session-recovery-ux": {0, 2},
     "feat-futures-official-product-lifecycle": {1, 2, 3},
     "feat-market-nasdaq-official-feed": {1, 2},
@@ -534,6 +536,7 @@ def normalize_prd(markdown: str, counts: dict[str, int]) -> str:
             "- 중복이던 뉴스·커뮤니티 어댑터는 공급자 선정 하위의 정식 노드 하나로 합치고 데이터 수집 하위 레거시 노드는 제거했다.",
             "- 소셜 로그인 전송 구현과 계정 생명주기 정책을 분리하고, WebSocket·Telegram·KIS 차트 어댑터의 구현 완료와 실제 장시간·자격정보 왕복을 서로 다른 기준으로 나눴다.",
             "- 분석 요청부터 근거 수집·부서 회의·분석 보관·위험 판정·사용자 승인·내부 체결·원장·섀도우까지 한 유저플로우로 연결하고 실패·복구 분기를 추가했다. 실제 엔진 통합 실행이 없는 후보 이후 단계와 레인 전체는 미완료로 교정했다.",
+            "- 2026-09-03 Cloud 격리 섀도우 원장은 실제 24시간·1,439건 대사를 통과했다. 공개 시장 스트림은 22.68시간 동안 4개 스트림 오류·재연결·전송 timeout 0건을 확인한 뒤 사용자 결정으로 조기 종료했으므로 24시간 완료 기준은 체크하지 않았다.",
             f"- 감사 후 기능 노드 상태: 완료 {counts['done']}개, 진행 중 {counts['in_progress']}개, 계획 {counts['planned']}개.",
         ]
     )
@@ -823,6 +826,34 @@ def main() -> None:
         # 저장소 문서·회귀 테스트에 근거가 있으므로 중복 미완료로 남기지 않는다.
         by_id["feat-security-social-login"]["acceptanceCriteria"][4]["isMet"] = True
         by_id["feat-records-external-integration-priority"]["acceptanceCriteria"][5]["isMet"] = True
+
+        external_soak = by_id["feat-auto-external-soak"]
+        cloud_soak_checks = [
+            (
+                "feat-auto-external-soak-ac-cloud-shadow-24h",
+                "Cloud 격리 섀도우 원장을 실제 24시간 실행해 사건 1,439건·원장 1,439건·실패 0건과 대사 통과를 확인한다.",
+            ),
+            (
+                "feat-auto-external-soak-ac-market-observation",
+                "공개 시장 스트림 4종을 22.68시간 관측해 오류·재연결·전송 timeout 0건을 확인했으나 사용자 조기 종료로 24시간 적격에는 포함하지 않는다.",
+            ),
+        ]
+        for check_id, description in cloud_soak_checks:
+            existing = next(
+                (item for item in external_soak["acceptanceCriteria"] if item["id"] == check_id),
+                None,
+            )
+            if existing is None:
+                external_soak["acceptanceCriteria"].append(
+                    {
+                        "id": check_id,
+                        "description": description,
+                        "isMet": True,
+                        "sortOrder": len(external_soak["acceptanceCriteria"]),
+                    }
+                )
+            else:
+                existing.update({"description": description, "isMet": True})
 
         workspace_settings = by_id["feat-workspace-settings"]
         workspace_settings["acceptanceCriteria"][1]["description"] = (

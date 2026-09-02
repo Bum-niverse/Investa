@@ -105,7 +105,7 @@ pnpm desktop:start
 
 브라우저 UI만 확인하려면 `pnpm dev`를 실행합니다.
 
-Cloud Run의 시장 스트림·내부 섀도우 24시간 검사는 `pnpm cloud:soak:collect`로 읽기 전용 상태 캐시를 갱신합니다. Google Cloud CLI 로그인은 앱 밖에서 관리하며, 앱의 `운영 준비·근거·복구` 화면은 `%APPDATA%\com.bumniverse.investa\audits\cloud-soak-status.json`의 제한된 요약만 읽습니다. 원본 Cloud 로그, OAuth 토큰과 금융 자격정보는 앱에 전달하지 않습니다. 로컬에 `gcloud`가 없거나 로그인되지 않은 경우에는 성공으로 추정하지 않고 수집 불가로 표시합니다.
+Cloud Run의 시장 스트림·내부 섀도우 24시간 검사는 `pnpm cloud:soak:collect`로 읽기 전용 상태 캐시를 갱신합니다. Google Cloud CLI 로그인은 앱 밖에서 관리하며, 앱의 `운영 준비·근거·복구` 화면은 `%APPDATA%\com.bumniverse.investa\audits\cloud-soak-status.json`의 제한된 요약만 읽습니다. 원본 Cloud 로그, OAuth 토큰과 금융 자격정보는 앱에 전달하지 않습니다. Windows 수집기는 PATH와 Google 공식 기본 설치 경로에서 `gcloud.cmd`를 찾으며, 별도 위치는 절대 경로 `GCLOUD_BIN`으로 지정할 수 있습니다. 로컬에 CLI가 없거나 로그인되지 않은 경우에는 성공으로 추정하지 않고 원인을 구분해 수집 불가로 표시합니다. 배포 전환 중 생성된 `investa.cloud-soak.v1`과 현재 `v2` 구조화 로그를 모두 읽되, 다른 스키마와 원문 로그는 판정에 사용하지 않습니다.
 
 ## 검증
 

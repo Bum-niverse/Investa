@@ -63,6 +63,17 @@ class MeetingFlowReconciliationTests(unittest.TestCase):
             for relative_path in node["codePaths"] + node["testPaths"]:
                 self.assertTrue((repository / relative_path).is_file(), relative_path)
 
+    def test_cloud_shadow_evidence_does_not_complete_desktop_soak(self) -> None:
+        feature = next(
+            item
+            for item in reconciliation.new_features()
+            if item["id"] == "feat-shadow-long-run-soak"
+        )
+        reconciliation.set_feature_checks(feature, {1, 2, 3})
+        self.assertEqual(feature["status"], "in_progress")
+        self.assertFalse(feature["acceptanceCriteria"][0]["isMet"])
+        self.assertTrue(feature["acceptanceCriteria"][3]["isMet"])
+
 
 if __name__ == "__main__":
     unittest.main()
