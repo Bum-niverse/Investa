@@ -16,7 +16,7 @@ use crate::{
     research::{ResearchReport, StrategyReview},
 };
 
-pub(crate) const SCHEMA_VERSION: u32 = 29;
+pub(crate) const SCHEMA_VERSION: u32 = 31;
 const MAX_HISTORY_LIMIT: u16 = 100;
 
 pub struct PersistenceBridge {
@@ -490,6 +490,20 @@ fn initialize(connection: &Connection) -> Result<(), String> {
              ) STRICT;
              CREATE INDEX IF NOT EXISTS workflow_jobs_updated_at
                  ON workflow_jobs(updated_at_ms DESC, job_id DESC);
+             CREATE TABLE IF NOT EXISTS meeting_paper_handoffs (
+                 handoff_id TEXT PRIMARY KEY NOT NULL CHECK(length(handoff_id) BETWEEN 1 AND 128),
+                 workflow_job_id TEXT NOT NULL UNIQUE REFERENCES workflow_jobs(job_id),
+                 analysis_record_id TEXT NOT NULL REFERENCES analysis_notes(record_id),
+                 symbol TEXT NOT NULL CHECK(length(symbol) BETWEEN 1 AND 32),
+                 strategy TEXT NOT NULL CHECK(length(strategy) BETWEEN 1 AND 500),
+                 experiment_id TEXT REFERENCES backtest_runs(experiment_id),
+                 paper_candidate_id TEXT REFERENCES paper_order_candidates(candidate_id),
+                 engine_run_id TEXT UNIQUE REFERENCES engine_runs(run_id),
+                 created_at_ms INTEGER NOT NULL CHECK(created_at_ms > 0),
+                 updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= created_at_ms)
+             ) STRICT;
+             CREATE INDEX IF NOT EXISTS meeting_paper_handoffs_updated_at
+                 ON meeting_paper_handoffs(updated_at_ms DESC, handoff_id DESC);
              CREATE TABLE IF NOT EXISTS analysis_notes (
                  record_id TEXT PRIMARY KEY NOT NULL,
                  kind TEXT NOT NULL CHECK(kind IN ('instrument', 'meeting', 'strategy')),
@@ -1026,6 +1040,32 @@ fn initialize(connection: &Connection) -> Result<(), String> {
                 })?;
         }
     }
+    if current_version == 30 {
+        let has_experiment_id: u32 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('meeting_paper_handoffs') WHERE name = 'experiment_id'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| storage_error("회의 백테스트 계보 열을 확인하지 못했습니다", error))?;
+        if has_experiment_id == 0 {
+            connection
+                .execute_batch(
+                    "ALTER TABLE meeting_paper_handoffs ADD COLUMN experiment_id TEXT REFERENCES backtest_runs(experiment_id);
+                     ALTER TABLE meeting_paper_handoffs ADD COLUMN paper_candidate_id TEXT REFERENCES paper_order_candidates(candidate_id);
+                     ",
+                )
+                .map_err(|error| storage_error("회의 백테스트·후보 계보를 확장하지 못했습니다", error))?;
+        }
+    }
+    connection
+        .execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS meeting_paper_handoffs_experiment
+                 ON meeting_paper_handoffs(experiment_id) WHERE experiment_id IS NOT NULL;
+             CREATE UNIQUE INDEX IF NOT EXISTS meeting_paper_handoffs_candidate
+                 ON meeting_paper_handoffs(paper_candidate_id) WHERE paper_candidate_id IS NOT NULL;",
+        )
+        .map_err(|error| storage_error("회의 백테스트·후보 계보 인덱스를 만들지 못했습니다", error))?;
     connection
         .pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(|error| storage_error("로컬 저장소 스키마 버전을 기록하지 못했습니다", error))?;
@@ -2533,6 +2573,43 @@ mod tests {
             .expect("version");
         assert_eq!(table_count, 1);
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn upgrades_version_thirty_with_meeting_backtest_lineage_columns() {
+        let connection = Connection::open_in_memory().expect("database should open");
+        connection
+            .execute_batch(
+                "CREATE TABLE meeting_paper_handoffs (
+                    handoff_id TEXT PRIMARY KEY NOT NULL,
+                    workflow_job_id TEXT NOT NULL UNIQUE,
+                    analysis_record_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    strategy TEXT NOT NULL,
+                    engine_run_id TEXT UNIQUE,
+                    created_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL
+                 ) STRICT;
+                 PRAGMA user_version = 30;",
+            )
+            .expect("version 30 schema");
+        initialize(&connection).expect("migration should succeed");
+        let experiment_column_count: u64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('meeting_paper_handoffs') WHERE name='experiment_id'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("experiment column");
+        let candidate_column_count: u64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('meeting_paper_handoffs') WHERE name='paper_candidate_id'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("candidate column");
+        assert_eq!(experiment_column_count, 1);
+        assert_eq!(candidate_column_count, 1);
     }
 
     #[test]

@@ -12,9 +12,10 @@ type ReplayEntry = { experimentId: string; classification: "system_check" | "res
 type ReplayRun = { experimentId: string; classification: ReplayEntry["classification"]; title: string; symbol: string; currency: string; initialCashMinor: number; finalCashMinor: number; finalEquityMinor: number; realizedPnlMinor: number; totalReturnBps: number; openPositionQuantity: number };
 type ReplayHistory = { runs: ReplayRun[]; entries: ReplayEntry[] };
 type EngineRunSummary = { runId: string; status: "completed" | "blocked" | "cancelled" | "interrupted"; symbol: string; market: string; candidateReady: boolean; updatedAtMs: number };
-type EngineRunReport = { runId: string; status: EngineRunSummary["status"]; symbol: string; market: string; candidateReady: boolean; blockers: string[]; createdAtMs: number };
+type EngineRunReport = { runId: string; analysisIds: string[]; status: EngineRunSummary["status"]; symbol: string; market: string; candidateReady: boolean; blockers: string[]; createdAtMs: number };
 type EngineOverview = { totalRuns: number; candidateReadyRuns: number; blockedRuns: number; interruptedRuns: number; latestRun?: EngineRunSummary | null; liveOrderEnabled: false };
 type EngineCandidate = { candidateId: string; runId: string; symbol: string; market: string; currency: string; side: string; quantity: number; status: string; updatedAtMs: number };
+type MeetingPaperHandoff = { handoffId: string; workflowJobId: string; analysisRecordId: string; symbol: string; strategy: string; experimentId?: string | null; paperCandidateId?: string | null; engineRunId?: string | null; status: string; blocker?: string | null; updatedAtMs: number; liveOrderEnabled: false };
 type OperationalAlert = { alertId: string; severity: "info" | "warning" | "critical"; message: string; occurrenceCount: number; acknowledgedAtMs?: number | null; lastSeenAtMs: number; response?: string | null };
 type HealthReport = { automatedTradingReady: boolean; components: Array<{ componentId: string; healthy: boolean; critical: boolean; detail: string }> };
 type BackupInspection = { fileName: string; integrityOk: boolean; schemaVersion: number; supportedSchemaVersion: number; restoreReady: boolean; blockers: string[]; auditEventCount: number; paperLedgerEventCount: number; researchReportCount: number };
@@ -42,6 +43,7 @@ export function LedgerWorkspace() {
   const [engineRuns, setEngineRuns] = useState<EngineRunSummary[]>([]);
   const [latestEngineReport, setLatestEngineReport] = useState<EngineRunReport | null>(null);
   const [engineCandidates, setEngineCandidates] = useState<EngineCandidate[]>([]);
+  const [meetingHandoffs, setMeetingHandoffs] = useState<MeetingPaperHandoff[]>([]);
   const [operationalAlerts, setOperationalAlerts] = useState<OperationalAlert[]>([]);
   const [healthReport, setHealthReport] = useState<HealthReport | null>(null);
   const [reconciliationState, setReconciliationState] = useState<ReconciliationState | null>(null);
@@ -76,7 +78,7 @@ export function LedgerWorkspace() {
     setLoading(true);
     try {
       const refreshedHealth = await invoke<HealthReport>("operations_health_refresh").catch(() => null);
-      const [accountResult, krwEvents, usdEvents, orders, candidateResult, analysisResult, replayResult, overviewResult, engineRunResult, engineCandidateResult, alertResult, reconciliationResult, backupResult] = await Promise.all([
+      const [accountResult, krwEvents, usdEvents, orders, candidateResult, analysisResult, replayResult, overviewResult, engineRunResult, engineCandidateResult, handoffResult, alertResult, reconciliationResult, backupResult] = await Promise.all([
         invoke<{ accounts: Account[] }>("paper_accounts_status"),
         invoke<LedgerEvent[]>("paper_ledger_history", { currency: "KRW", limit: 100 }),
         invoke<LedgerEvent[]>("paper_ledger_history", { currency: "USD", limit: 100 }),
@@ -86,13 +88,14 @@ export function LedgerWorkspace() {
         invoke<EngineOverview>("engine_runtime_overview"),
         invoke<EngineRunSummary[]>("engine_run_history", { limit: 20 }),
         invoke<EngineCandidate[]>("engine_order_candidates"),
+        invoke<MeetingPaperHandoff[]>("meeting_paper_handoff_history", { limit: 100 }),
         invoke<OperationalAlert[]>("operational_alerts"),
         invoke<ReconciliationState>("runtime_reconciliation_status"),
         invoke<BackupInventoryEntry[]>("local_backup_inventory"),
       ]);
       setAccounts(accountResult.accounts); setEvents([...krwEvents.map((event) => ({ currency: "KRW", event })), ...usdEvents.map((event) => ({ currency: "USD", event }))]);
       setManualOrders(orders); setCandidates(candidateResult); setAnalyses(analysisResult); setReplayEntries(replayResult.entries); setReplayRuns(replayResult.runs); setEngineOverview(overviewResult); setEngineRuns(engineRunResult); setSelectedReplayId((current) => replayResult.runs.some((run) => run.experimentId === current) ? current : replayResult.runs[0]?.experimentId ?? "");
-      setEngineCandidates(engineCandidateResult); setOperationalAlerts(alertResult);
+      setEngineCandidates(engineCandidateResult); setMeetingHandoffs(handoffResult); setOperationalAlerts(alertResult);
       setHealthReport(refreshedHealth);
       setReconciliationState(reconciliationResult);
       setBackupInventory(backupResult);
@@ -155,6 +158,7 @@ export function LedgerWorkspace() {
     <header className="ledger-header"><div><p className="eyebrow">APPEND-ONLY PAPER LEDGER</p><h2>모의 원장·성과</h2><p>내부 체결 사건과 검증된 백테스트 성과만 표시합니다.</p></div><button type="button" onClick={() => void load()} disabled={loading}>{loading ? "검사 중" : "새로고침"}</button></header>
     <div className="ledger-tabs" role="tablist"><button role="tab" aria-selected={tab === "ledger"} className={tab === "ledger" ? "is-active" : ""} onClick={() => setTab("ledger")}>원장</button><button role="tab" aria-selected={tab === "performance"} className={tab === "performance" ? "is-active" : ""} onClick={() => setTab("performance")}>성과 분석</button></div>
     {error && <p className="ledger-error" role="alert">{error}</p>}
+    {tab === "performance" && meetingHandoffs.length > 0 && <section className="ledger-panels" aria-label="회의 분석 인계 계보"><article><h3>회의 → 백테스트 → 섀도우 후보 계보</h3><p>회의 종합 보고는 주문으로 바로 전송되지 않습니다. 동일 분석 기록을 참조한 백테스트만 연결하며, 현재 신호가 생겨도 사용자 승인 전 내부 모의주문 후보로만 남습니다.</p>{meetingHandoffs.slice(0, 5).map((handoff) => <div className="ledger-order-row" key={handoff.handoffId}><div><strong>{handoff.symbol} · {handoff.status}</strong><span>{handoff.strategy}</span></div><small>{handoff.analysisRecordId} → {handoff.experimentId ?? "백테스트 대기"} → {handoff.paperCandidateId ?? handoff.engineRunId ?? "신호 감시"}{handoff.blocker ? ` · ${handoff.blocker}` : ""}</small></div>)}</article></section>}
     {tab === "performance" && reconciliationState?.candidateActionsLocked !== false && <div className="ledger-error" role="status"><strong>재시작 원장 대사 전 주문 후보 생성·승인이 잠겨 있습니다.</strong> <button type="button" onClick={() => void reconcileRuntime()}>지금 내부 원장 대사</button></div>}
     {tab === "ledger" ? <>
       <div className="ledger-tabs" aria-label="원장 출처">

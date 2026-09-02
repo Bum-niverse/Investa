@@ -44,6 +44,18 @@ pub struct WorkspaceIdentityStatus {
     linked_account_count: usize,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceIdentityLifecyclePolicy {
+    recovery_providers: Vec<String>,
+    can_unlink_connected_provider: bool,
+    can_delete_workspace: bool,
+    deletion_requires_explicit_confirmation: bool,
+    retained_on_account_unlink: Vec<&'static str>,
+    deleted_on_workspace_deletion: Vec<&'static str>,
+    message: &'static str,
+}
+
 fn credential(service: &str, account: &str) -> Result<Entry, String> {
     Entry::new(service, account)
         .map_err(|_| "작업공간 소유자 보안 저장소를 열지 못했습니다.".to_owned())
@@ -150,6 +162,23 @@ fn link_record(mut record: WorkspaceOwnerRecord, identity: LinkedIdentity) -> Wo
     record
 }
 
+fn unlink_provider_record(
+    mut record: WorkspaceOwnerRecord,
+    provider: &str,
+) -> Result<WorkspaceOwnerRecord, String> {
+    if provider == record.primary.provider {
+        return Err("주 소유자 공급자는 해제할 수 없습니다. 다른 연결 계정으로 소유권을 자동 이전하지 않습니다.".to_owned());
+    }
+    let before = record.linked_identities.len();
+    record
+        .linked_identities
+        .retain(|identity| identity.provider != provider);
+    if record.linked_identities.len() == before {
+        return Err("해제할 연결 계정이 없습니다.".to_owned());
+    }
+    Ok(record)
+}
+
 fn provider_label(provider: &str) -> &str {
     match provider {
         "github" => "GitHub",
@@ -192,6 +221,59 @@ impl WorkspaceIdentityBridge {
         save_record(&link_record(record, identity))
     }
 
+    fn unlink_provider(&self, provider: &str, confirmation: &str) -> Result<(), String> {
+        if !matches!(provider, "github" | "google" | "apple") {
+            return Err("지원하지 않는 로그인 공급자입니다.".to_owned());
+        }
+        let expected = format!("{} 연결 해제", provider_label(provider));
+        if confirmation.trim() != expected {
+            return Err(format!("확인 문구 `{expected}`를 정확히 입력해 주세요."));
+        }
+        let authenticated = self
+            .authenticated
+            .lock()
+            .map_err(|_| "로그인 세션 잠금을 열지 못했습니다.".to_owned())?
+            .clone()
+            .ok_or_else(|| "소유자 계정으로 다시 로그인한 뒤 연결을 해제해 주세요.".to_owned())?;
+        let record = load_or_migrate_record()?
+            .ok_or_else(|| "작업공간 소유자 정보가 없습니다.".to_owned())?;
+        if !record.linked_identities.contains(&authenticated.0) {
+            return Err("현재 로그인 세션은 이 작업공간의 소유자가 아닙니다.".to_owned());
+        }
+        save_record(&unlink_provider_record(record, provider)?)
+    }
+
+    fn logout(&self) -> Result<(), String> {
+        *self
+            .authenticated
+            .lock()
+            .map_err(|_| "로그인 세션 잠금을 열지 못했습니다.".to_owned())? = None;
+        Ok(())
+    }
+
+    fn lifecycle_policy(&self) -> Result<WorkspaceIdentityLifecyclePolicy, String> {
+        let status = self.status()?;
+        Ok(WorkspaceIdentityLifecyclePolicy {
+            recovery_providers: status.linked_providers,
+            can_unlink_connected_provider: status.session_authenticated
+                && status.linked_account_count > 1,
+            can_delete_workspace: false,
+            deletion_requires_explicit_confirmation: true,
+            retained_on_account_unlink: vec![
+                "SQLite 분석·백테스트·모의원장",
+                "차트 선과 로컬 설정",
+                "감사 기록과 검증 백업",
+            ],
+            deleted_on_workspace_deletion: vec![
+                "작업공간 소유자·연결 계정 식별자",
+                "로컬 SQLite와 차트 저장 데이터",
+                "금융·AI·뉴스 공급자 보안 저장소 항목",
+                "로컬 백업과 내보낸 감사 파일",
+            ],
+            message: "계정 연결 해제는 로컬 투자 기록을 삭제하지 않습니다. 작업공간 삭제는 별도 백업·재인증·명시 승인 흐름이 구현되기 전까지 비활성화됩니다.",
+        })
+    }
+
     fn status(&self) -> Result<WorkspaceIdentityStatus, String> {
         let record = load_or_migrate_record()?;
         let session_authenticated = self
@@ -230,6 +312,30 @@ pub fn workspace_identity_status(
     bridge: tauri::State<'_, WorkspaceIdentityBridge>,
 ) -> Result<WorkspaceIdentityStatus, String> {
     bridge.status()
+}
+
+#[tauri::command]
+pub fn workspace_identity_lifecycle_policy(
+    bridge: tauri::State<'_, WorkspaceIdentityBridge>,
+) -> Result<WorkspaceIdentityLifecyclePolicy, String> {
+    bridge.lifecycle_policy()
+}
+
+#[tauri::command]
+pub fn workspace_identity_unlink_provider(
+    bridge: tauri::State<'_, WorkspaceIdentityBridge>,
+    provider: String,
+    confirmation: String,
+) -> Result<WorkspaceIdentityStatus, String> {
+    bridge.unlink_provider(&provider, &confirmation)?;
+    bridge.status()
+}
+
+#[tauri::command]
+pub fn workspace_identity_logout(
+    bridge: tauri::State<'_, WorkspaceIdentityBridge>,
+) -> Result<(), String> {
+    bridge.logout()
 }
 
 #[cfg(test)]
@@ -275,5 +381,21 @@ mod tests {
         let record = link_record(record, google);
         assert_eq!(record.primary, github);
         assert_eq!(record.linked_identities.len(), 2);
+    }
+
+    #[test]
+    fn linked_provider_can_be_removed_without_deleting_workspace_data() {
+        let github = identity("github", "1001");
+        let google = identity("google", "google-subject");
+        let record = link_record(record_for_primary(github.clone()), google);
+        let record = unlink_provider_record(record, "google").unwrap();
+        assert_eq!(record.primary, github);
+        assert_eq!(record.linked_identities.len(), 1);
+    }
+
+    #[test]
+    fn primary_provider_cannot_be_unlinked_or_implicitly_transferred() {
+        let record = record_for_primary(identity("github", "1001"));
+        assert!(unlink_provider_record(record, "github").is_err());
     }
 }

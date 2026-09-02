@@ -12,7 +12,9 @@
 
 실시간 시장 전송(2026-08-31): 토스 인증 WebSocket을 Rust로 연결했다. access token은 handshake의 Authorization 헤더에만 사용하고 상태·React·로그에 노출하지 않는다. 체결·호가 topic만 허용하고 개인 주문 topic을 차단하며 60초 PING, ack timeout, backoff+jitter 재연결과 완료 봉 집계를 연결했다. 저장 자격정보로 공식 101 handshake, 국장 구독 ack와 즉시 PING/pong을 통과했지만 장중 KR/US 체결·호가, 60초 주기 장시간 PING/pong, 24시간 내구 검증은 남아 있다.
 
-내부 섀도우 내구 검사(2026-08-31): 운영 패널에서 1분 실제 표본 수집을 시작할 수 있다. Windows working set, SQLite 크기, 활성 섀도우 작업자, 내부 후보, SQLite·KRW·USD 원장 건강과 재시작 대사를 수집하며 3분 초과 공백은 fail-closed다. 앱 재시작 뒤에는 자동으로 표본을 만들지 않고 사용자가 `재시작 원장 대사 후 계속`을 눌러야 하며 실제 24시간 결과는 아직 미완료다.
+내부 섀도우 내구 검사(2026-08-31): 운영 패널 또는 명시적 `--shadow-soak-autostart` 숨김 Tauri 실행에서 1분 실제 표본 수집을 시작할 수 있다. Windows working set, SQLite 크기, 활성 섀도우 작업자, 내부 후보, SQLite·KRW·USD 원장 건강과 재시작 대사를 수집하며 3분 초과 공백은 fail-closed다. 중복 실행 잠금은 DB 재시작 상태를 변경하기 전에 원자적으로 획득한다. 2026-08-31 06:53 KST에 화면 비의존 실제 24시간 검사를 시작했으며 완료 전에는 통과로 판정하지 않는다.
+
+회의→섀도우 골든패스 연결(2026-08-31): `paper_candidate` 회의의 불변 분석 ID와 단일 종목·지원 전략을 백테스트에 연결했다. 자연어 전략은 이동평균 교차·가격 채널·평균회귀·ATR 변동성 확장 계약으로 정확히 파싱될 때만 실행한다. 백테스트 뒤 현재 완료 봉 신호가 없으면 60초 섀도우 감시로 남고, 신호가 있을 때만 내부 후보를 생성한다. 후보는 계속 사용자 승인 전 `safety_approved`이며 실주문은 없다. 현재 자동 감시는 KRW 주식·업비트 KRW 현물만 지원하고 USD 주식·선물은 차단한다. 실제 공급자 왕복과 사용자 승인·내부 원장 1회 체결은 화면 조작 없이 아직 검증하지 않았다.
 
 ## 1. 가장 먼저 할 일
 
@@ -176,17 +178,19 @@ C:\Users\Kim Beom soo\OneDrive\Documents\ProjectStudio
 Investa ProjectStudio 상태:
 
 - project ID: `36e87491-74a8-48ca-a7b8-30fa6ccea131`
-- PRD revision: `168`
-- 기능명세: 279개 (`done` 222, `in_progress` 51, `planned` 6)
+- PRD revision: `177`
+- 기능명세: 279개 (`done` 223, `in_progress` 51, `planned` 5)
 - 자동매매·모델 고정 로드맵: `feat-auto-roadmap`과 하위 기능. 전략 승격·자동 배치·롤백, `PIT 데이터 매니페스트·ML worker 계약`, `LightGBM·XGBoost 기준 worker`, `OOS 원시 확률 Rust 재계산`, `PIT 데이터·라벨 빌더`, `XGBoost shard-aware 외부 메모리 worker`를 완료했다. `공식 실제시장 ML 기준 검증`은 730일·1h·4h·1d의 48개 모델과 fold별 과거 기준 레짐·비용·funding 스트레스를 마쳤지만 3~5년·분봉·주식·실계정 비용·호가 검증이 남아 `in_progress`이며, ML 모델 개발 상위 항목도 계속 진행 중이다.
 - 전략 판단·실행 주기 계약: `feat-auto-cadence-contract`, 완료 기준 4/4. 완료 봉 플러그인의 tick 판단과 interval 불일치를 거부하며 실주문은 잠겨 있다.
 - 뉴스·커뮤니티 어댑터 중복 노드를 `feat-official-news-community-adapters` 하나로 통합했다.
-- 유저플로: 노드 108개, 엣지 93개
+- 유저플로: 노드 123개, 엣지 110개
 - 기술적 분석 차트 주석 기능: `feat-technical-chart-annotation-report`, 완료 기준 4/4
 - 연결 유저플로: `flow-analysis-vault-6`, 완료
 - 로그인 후 읽기 전용 전체 연결 자동 조회와 설정의 수동 재조회: `feat-automatic-connection-refresh`, 완료
 - Google·Apple 선택 로그인 보안 경계: `feat-security-social-login`, Google 실제 로그인 왕복 완료·통합 작업공간 소유자와 명시적 계정 연결 코드 완료·교차 계정 UI 왕복 및 Apple 공식 callback 준비 대기
 - Codex 분석 품질 프로필: `feat-codex-analysis-quality-profile`, 계정 지원 모델 검증·직원 high·본부장 xhigh·원본 근거 재대조·허위 evidence ID 차단 완료
+- 2026-08-31 상태 재감사: 구조 오류는 0건이다. OAuth 전송 구현과 계정 생명주기 정책의 의미 중복을 제거했고, 토스 WebSocket·Telegram·KIS 차트 어댑터의 구현 완료와 실제 장시간·자격정보 왕복을 별도 수용 기준으로 분리했다. 완료 수는 과장하지 않아 222개를 유지한다.
+- 2026-09-02 revision 177: OpenDART 공시목록·네이버 뉴스 검색 읽기 전용 어댑터, Claude·Antigravity의 공통 `RoleReport`·`DepartmentReport` 검증과 직원별 상태·취소·승인형 부서 집계, 연결 계정 해제·복구·데이터 보존 정책을 반영했다. 분석→백테스트→후보→승인→내부 원장은 고정 fixture 자동 골든패스를 통과해 해당 세 노드만 체크했다. 실제 공급자 키 왕복, 실제 시장 신호와 장시간 섀도우, 작업공간 전체 삭제는 미완료로 분리했다.
 
 현재 상태를 읽기 전용으로 감사하는 명령:
 
@@ -233,7 +237,9 @@ Pop-Location
 pnpm tauri dev
 ```
 
-브라우저 UI만 볼 때는 `pnpm dev`를 사용한다. Tauri 실행 중 localhost 연결 거부가 나오면 오래된 바탕화면 바로가기로 개발 URL만 연 것이 아닌지 확인하고, 저장소에서 `pnpm tauri dev`를 실행해 Vite와 Tauri를 함께 시작한다.
+일반 실행은 `pnpm desktop:start`를 사용한다. 기존 `scripts/launch_investa.ps1`이 최신 release를 증분 빌드한 뒤 내장 `frontendDist`로 실행하므로 localhost가 필요하지 않다. 브라우저 UI만 볼 때는 `pnpm dev`, 개발 Tauri는 `pnpm tauri dev`를 사용한다. `pnpm desktop:check`는 앱을 열지 않고 release 갱신 필요 여부만 출력한다.
+
+Cloud Run 24시간 시장·섀도우 검사는 `pnpm cloud:soak:collect`가 고정 프로젝트·리전·작업의 구조화 로그를 읽어 앱 데이터 `audits/cloud-soak-status.json`에 원자적으로 축약한다. 앱 운영 화면은 이 고정 경로의 256KB 이하 `investa.cloud-soak-report.v1`만 읽고, 알 수 없는 필드·실주문 허용·다른 프로젝트 캐시는 거부한다. Cloud CLI가 없거나 인증되지 않은 환경은 `수집 불가`이며 통과로 추정하지 않는다.
 
 자격정보는 Git으로 이전되지 않는다. 새 노트북의 설정 화면에서 필요한 공급자를 다시 연결하고 Windows 자격 증명 관리자에 저장한다. 기존 PC의 token이나 secret을 문서·채팅으로 복사하지 않는다.
 
@@ -263,6 +269,7 @@ pnpm tauri dev
 - 국장·미장 시장가 즉시 모의체결은 주문 직전 공식 캘린더가 5분 이내이고 `regularMarket` 안일 때만 허용하며 휴장·장외·결측은 fail-closed로 차단한다.
 - 공개 스트림 실제 시간 내구 검사기를 추가했다. 25초 smoke에서 Upbit·Binance Spot·COIN-M은 통과했고 USDⓈ-M은 구독 연결 후 메시지 미수신으로 실패했다.
 - 토스 공식 AsyncAPI 기반 체결·호가 구독 선언과 Rust 인증 WebSocket 전송을 구현했다. `personal:order`는 SHADOW ONLY 경계에서 거부하며 공식 handshake·국장 구독 ack까지 실제 확인했다. 장중 KR/US 체결·호가와 24시간 왕복은 남아 있다.
+- 회의 종합의 `paper_candidate`를 주문으로 직접 바꾸지 않고 `회의 작업 ID → 분석 ID → 종목·전략 → 엔진 실행 → 내부 후보` 계보로 인계한다. 동일 분석 ID와 종목의 후보 준비 엔진 실행만 재시작 대사에서 연결하며, 사용자 승인 전에는 내부 모의체결도 발생하지 않는다.
 
 ### 계정·외부 결정 필요
 
@@ -292,7 +299,7 @@ cargo test --manifest-path src-tauri/Cargo.toml
 Push-Location server/relay; node --test; Pop-Location
 ```
 
-2026-08-30 기준 프론트 테스트 30개, TypeScript/Vite 빌드와 Rust format 검사가 통과했고 Rust 테스트는 321개 통과·외부 통합 검사 11개 ignored, Python ML worker 테스트는 13개, 실제시장 검증 runner 테스트는 13개, relay 테스트는 8개 통과했다. `internal-execution-v1`은 분할·재호가·명시적 부분체결·취소·만료·멱등성과 최대 2배 격리증거금·reduce-only·청산 완충 경계를 로컬 SQLite에서 검증하며 외부 주문 전송을 포함하지 않는다. 별도 외부 검사는 저장된 토스 자격정보로 시세·읽기 전용 계좌 DTO와 KR·US 장 캘린더를, 자격정보 없는 Upbit 현물과 Binance 현물·USDⓈ-M·COIN-M 공개 시세 및 분석 snapshot을 실제 응답으로 확인했다. Binance 공식 공개 BTC·ETH 현물·USDⓈ-M 730일 `1h`·`4h`·`1d`는 48개 expanding walk-forward XGBoost 모델과 fold별 과거 기준 6개 관측 레짐 검증을 통과했지만, 비용·funding을 적용한 비중첩 OOS 거래는 1배 비용부터 12개 조합 모두 순손실이라 전략 후보로 기각했다. 공개 WebSocket 체결을 1분봉·상위 주기로 집계하고 SQLite 체크포인트로 재시작 상태를 복원한다. 25초 실수신 재검사에서는 Upbit·Binance Spot·COIN-M 메시지를 수신했으나 USDⓈ-M은 제한 시간 내 메시지가 없어 재검증이 남았다. 이후 저장된 Upbit·Binance 자격정보로 개인계좌 읽기 전용 조회도 통과했다. KIS 국내선물은 이 PC에 모의 자격정보가 없어 계약 파서와 요청 경계까지만 검증했다. Claude·Antigravity 어댑터는 자격정보 형식·유료호출 확인·비밀문자열 차단·응답 정규화 테스트를 통과했으며 실제 API 키 왕복은 미검증이다. 새 노트북에서는 이 숫자를 신뢰해 생략하지 말고 다시 실행한다.
+2026-08-31 기준 프론트 테스트 34개, TypeScript/Vite 빌드와 Rust format 검사가 통과했고 Rust 테스트는 337개 통과·외부 통합 검사 13개 ignored, Python ProjectStudio 정합성 테스트 4개, relay 테스트는 8개 통과했다. `internal-execution-v1`은 분할·재호가·명시적 부분체결·취소·만료·멱등성과 최대 2배 격리증거금·reduce-only·청산 완충 경계를 로컬 SQLite에서 검증하며 외부 주문 전송을 포함하지 않는다. 별도 외부 검사는 저장된 토스 자격정보로 시세·읽기 전용 계좌 DTO와 KR·US 장 캘린더를, 자격정보 없는 Upbit 현물과 Binance 현물·USDⓈ-M·COIN-M 공개 시세 및 분석 snapshot을 실제 응답으로 확인했다. Binance 공식 공개 BTC·ETH 현물·USDⓈ-M 730일 `1h`·`4h`·`1d`는 48개 expanding walk-forward XGBoost 모델과 fold별 과거 기준 6개 관측 레짐 검증을 통과했지만, 비용·funding을 적용한 비중첩 OOS 거래는 1배 비용부터 12개 조합 모두 순손실이라 전략 후보로 기각했다. 공개 WebSocket 체결을 1분봉·상위 주기로 집계하고 SQLite 체크포인트로 재시작 상태를 복원한다. 25초 실수신 재검사에서는 Upbit·Binance Spot·COIN-M 메시지를 수신했으나 USDⓈ-M은 제한 시간 내 메시지가 없어 재검증이 남았다. 이후 저장된 Upbit·Binance 자격정보로 개인계좌 읽기 전용 조회도 통과했다. KIS 국내선물은 이 PC에 모의 자격정보가 없어 계약 파서와 요청 경계까지만 검증했다. Claude·Antigravity 어댑터는 자격정보 형식·유료호출 확인·비밀문자열 차단·응답 정규화 테스트를 통과했으며 실제 API 키 왕복은 미검증이다. 새 노트북에서는 이 숫자를 신뢰해 생략하지 말고 다시 실행한다.
 
 ## 11. 작업 재개 시 보고 형식
 
@@ -307,6 +314,13 @@ Codex는 매 작업마다 다음을 분리해 기록한다.
 - 의도적으로 잠금 유지
 
 기능명세의 `done`은 코드 경로와 수용 기준, 테스트 근거가 모두 있을 때만 사용한다. 기반만 있거나 외부 왕복이 남으면 `in_progress`, 공급자·계정·모델 결정 전이면 `planned`를 유지한다.
+
+## 2026-09-02 분석 골든패스·외부 AI 직원 운영
+
+- 회의 분석 인계 뒤 분석 기록·백테스트 계보·안전 후보·사용자 승인·append-only 내부 원장을 단계별로 검사하는 읽기 전용 골든패스 감사를 추가했다. 고정 fixture 전체 통과와 후보 없는 대기 경로를 자동 테스트하며 실주문은 항상 잠겨 있다.
+- 직원별 대화와 사용자가 승인한 부서 업무에서 Codex·Claude·Google Antigravity를 선택할 수 있다. 외부 공급자는 동일한 역할/부서 보고 계약, 단계 상태 이벤트와 취소를 사용하며 금융 자격정보와 주문 도구를 받지 않는다.
+- Google OIDC 로그인과 Gemini API 인증은 분리한다. Google AI Pro 구독만으로 API 권한이 생긴다고 가정하지 않으며 Google AI Studio 인증키를 Windows 자격 증명 관리자에 별도 저장해야 한다. 실제 키 왕복은 아직 수행하지 않았다.
+- 현재 전체 검증: 프론트 41개 통과, Rust 351개 통과·외부 실제 왕복 14개 ignored, relay 8개 통과, ProjectStudio 정합성 4개 통과. Vite는 537KB 메인 chunk 경고만 남고 빌드는 성공했다.
 # 2026-08-28 자동매매 주기 계약 진행
 
 - 퀀트 논문 연구원 패널에서 저장 보고서를 `1m` 또는 `1d`로 새 불변 실험 재검증할 수 있다.

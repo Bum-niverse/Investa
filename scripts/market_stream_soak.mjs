@@ -22,7 +22,7 @@ const definitions = [
     ]),
   },
   { id: "binance_spot", url: "wss://stream.binance.com:9443/ws/btcusdt@aggTrade" },
-  { id: "binance_usdm", url: "wss://fstream.binance.com/stream?streams=btcusdt@aggTrade/btcusdt@markPrice@1s" },
+  { id: "binance_usdm", url: "wss://fstream.binance.com/market/ws/btcusdt@markPrice@1s" },
   { id: "binance_coinm", url: "wss://dstream.binance.com/stream?streams=btcusd_perp@aggTrade/btcusd_perp@markPrice@1s" },
 ];
 

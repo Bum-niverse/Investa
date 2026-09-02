@@ -2974,6 +2974,51 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "저장된 토스증권 자격정보로 지정 종목의 익명화된 보유 근거만 확인하는 명시적 읽기 전용 검사"]
+    fn live_toss_position_evidence_excludes_account_identifiers() {
+        let symbol = env::var("INVESTA_LIVE_POSITION_SYMBOL")
+            .expect("INVESTA_LIVE_POSITION_SYMBOL must be explicitly set");
+        let credentials = load_credentials()
+            .expect("credential store")
+            .expect("stored Toss credentials");
+        let accounts = tauri::async_runtime::block_on(
+            MarketDataBridge::default().fetch_account_snapshot_with_credentials(&credentials),
+        )
+        .expect("Toss read-only account snapshot");
+        let positions = accounts
+            .iter()
+            .flat_map(|account| account.holdings.items.iter())
+            .filter(|holding| holding.symbol.eq_ignore_ascii_case(&symbol))
+            .map(|holding| {
+                serde_json::json!({
+                    "symbol": holding.symbol,
+                    "name": holding.name,
+                    "marketCountry": holding.market_country,
+                    "currency": holding.currency,
+                    "quantity": holding.quantity,
+                    "lastPrice": holding.last_price,
+                    "averagePurchasePrice": holding.average_purchase_price,
+                    "readOnly": true,
+                    "liveOrderEnabled": false,
+                })
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !positions.is_empty(),
+            "the requested symbol must exist in the connected account holdings"
+        );
+        let serialized = serde_json::to_string(&positions).expect("sanitized positions");
+        assert!(!serialized.contains("accountAlias"));
+        assert!(!serialized.contains("accountNo"));
+        assert!(!serialized.contains("maskedAccountNo"));
+        println!(
+            "TOSS_POSITION_EVIDENCE_FOUND symbol={} matches={} read_only=true live_order_enabled=false",
+            symbol,
+            positions.len()
+        );
+    }
+
+    #[test]
     #[ignore = "연결된 토스증권 자격정보와 외부 장 캘린더 서버를 사용하는 명시적 읽기 전용 검사"]
     fn live_toss_market_calendars_use_official_sessions() {
         let credentials = load_credentials()

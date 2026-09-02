@@ -72,4 +72,28 @@ node scripts/market_stream_soak.mjs --duration-seconds 86400 --output "$env:LOCA
 
 내부 섀도우 검사는 `운영 준비·근거·복구`의 `24시간 내부 섀도우 내구 검사`에서 시작한다. 1분마다 Windows 프로세스 working set, SQLite 파일 크기, 활성 섀도우 작업자 수, 최근 내부 후보, SQLite·KRW·USD 원장 건강 상태와 재시작 대사 결과를 수집한다. 진행 세션은 자격정보 없이 로컬 저장소에 보존되어 앱 재시작 뒤 이어지지만, 실제 표본 간격이 3분을 넘거나 재시작 대사가 실패하면 결과는 fail-closed다. 실행 중 앱을 오래 종료한 시간을 24시간 운용으로 꾸며내지 않는다.
 
+화면을 열지 않고 같은 검사를 수행할 때는 빌드된 Tauri 실행 파일에 `--shadow-soak-autostart`를 전달한다. 이 플래그는 메인 창을 숨긴 뒤 실제 Rust 섀도우 worker와 동일 프로세스의 메모리·SQLite·원장을 1분마다 관측한다. `%APPDATA%\com.bumniverse.investa\audits\shadow-soak-<시작시각>.jsonl`에는 진행 표본을 append-only로 남기고, 24시간을 실제로 경과한 뒤에만 `.result.json`과 SQLite 감사 결과를 확정한다. `shadow-soak-24h.lock`은 동시에 두 검사가 원장과 진행 파일을 공유하지 못하게 원자적으로 차단한다. 비정상 종료로 잠금 파일이 남으면 자동 성공 처리하거나 이어 붙이지 않고, 원장 대사와 실패 원인을 확인한 뒤 새 실행으로 시작한다.
+
 2026-08-31 공개 스트림 24시간 실제 시간 검사를 백그라운드로 시작했다. 결과는 `%LOCALAPPDATA%\Investa\audits\market-stream-soak-24h-20260831.json`에 원자적으로 생성되며 종료 전에는 완료로 판정하지 않는다. 표준 출력·오류도 같은 폴더에 분리 저장한다.
+
+2026-08-31 06:53 KST에는 `--shadow-soak-autostart`로 화면 비의존 내부 섀도우 실제 시간 검사를 함께 시작했다. 첫 표본과 60초 뒤 두 번째 표본에서 공급자 건강과 원장 대사가 모두 통과했고, 중복 실행 프로세스는 DB 상태를 변경하지 않고 종료됐다. 이 짧은 확인은 시작 경로 검증일 뿐이며 실제 24시간 결과는 계속 미완료다.
+
+## Cloud Run Job 분리 실행
+
+PC 전원과 무관한 검수는 `server/cloud-soak` 이미지의 두 Cloud Run Job으로 분리한다. `market`은 네 공개 WebSocket의 실제 장시간 수신을, `shadow-contract`는 비밀정보와 사용자 DB를 반출하지 않은 격리 SQLite의 append-only·트랜잭션·대사 계약을 검증한다. 두 실행은 60초 heartbeat와 최종 `actualElapsed24hQualified`를 Cloud Logging에 남긴다.
+
+격리 원장 검사는 Windows Tauri 프로세스, 사용자 SQLite, Windows 자격 증명 관리자와 실제 계좌 연결을 검증하지 않는다. 따라서 클라우드 두 작업이 통과해도 데스크톱 통합 24시간 검사는 별도 미완료로 유지한다. 이전 `--shadow-soak-autostart` 실행에서 확인된 Windows UI 런타임 종료 충돌을 성공으로 간주하거나 클라우드 계약 검사로 대체하지 않는다.
+
+2026-09-01 최초 Cloud heartbeat에서 USDⓈ-M만 메시지 0건과 stale 재연결이 반복됐다. Binance 공식 변경 이력상 2026-04-23 기존 USDⓈ-M WebSocket 경로가 종료됐으므로 일반 mark price 스트림을 `wss://fstream.binance.com/market/ws/<stream>`으로 교체했다. 공개 고빈도 호가의 `/public`, 일반 시세의 `/market`, 사용자 데이터의 `/private` 경계를 섞지 않는다.
+
+2026-09-02 구버전 `v1` 시장 실행은 약 7시간 46분 시점에 Upbit 체결 44,441건·WebSocket 오류 0건이었지만, 20초 무체결을 연결 장애로 처리해 stale·재연결을 각각 137회 만들었다. 이 실행은 취소하지 않고 최종 결과를 원본 그대로 보존한다. 수정판 `v2`는 30초 텍스트 PING과 `UP` 응답으로 전송 생존을 별도 확인하고, 이벤트 기반 `trade`의 20초 체결 공백은 경고로만 남긴다. 실제 전송 timeout·close·error와 시장 이벤트 공백을 서로 다른 필드와 판정으로 유지하며 새 실행 ID에서 다시 24시간 검증한다.
+
+같은 날 기존 실행 `investa-market-soak-24h-5xp8d`와 `investa-shadow-contract-soak-24h-x95sr`가 각각 `runningCount=1`인 상태를 다시 확인한 뒤 별도 Job `investa-market-soak-24h-v2`를 만들었다. 새 이미지는 `20260902-1`(digest `sha256:6a1081a94c1d256746bae50987189d590e2b2894c64580958b1c1132318ca657`), 새 실행은 `investa-market-soak-24h-v2-mkr74`다. 이로써 v1 결과와 v2 결과는 Job·이미지·실행 ID가 모두 분리되어 서로 덮어쓰지 않는다.
+
+v2 첫 60초 heartbeat(`investa.cloud-soak.v2`)에서 Upbit 체결 183건, 전송 heartbeat 3건, 오류·재연결·전송 timeout·시장 공백 이벤트 0건을 확인했다. 같은 표본에서 Binance 현물 648건, USDⓈ-M 60건, COIN-M 60건을 수신했고 세 스트림 모두 오류·재연결·전송 timeout 0건이었다. 이는 새 판정과 실행 경로의 초기 검증일 뿐이며 24시간 최종 통과는 `actualElapsed24hQualified=true`와 최종 `completed` 로그가 생성된 뒤에만 확정한다.
+
+## 읽기 전용 결과 수집과 앱 표시
+
+`scripts/cloud_soak_report.mjs`는 고정 프로젝트 `investa-remote-bumniverse`, 리전 `asia-northeast3`와 허용된 시장·섀도우 작업만 Google Cloud CLI로 읽는다. Cloud Run execution과 `investa.cloud-soak.v2` 구조화 로그에서 실행 시각, 최근 heartbeat, 허용된 카운터와 최종 판정만 추리고 원본 로그·토큰·환경변수는 복사하지 않는다. 결과는 앱 데이터 `audits/cloud-soak-status.json`과 사람이 읽는 Markdown에 임시 파일·이전 캐시 복구가 가능한 교체 방식으로 저장한다.
+
+운영 패널은 Tauri가 고정 경로의 256KB 이하 캐시를 엄격한 스키마로 검증한 결과만 표시한다. 사용자가 누르는 `저장된 검사 결과 다시 읽기`는 Cloud API를 호출하거나 인증을 요구하지 않는다. 24시간 실측, 성공 종료와 이슈 0건을 모두 충족해야 `24시간 검사 통과`로 표시하며 수집 실패·구버전 로그·짧은 실행을 성공으로 해석하지 않는다.

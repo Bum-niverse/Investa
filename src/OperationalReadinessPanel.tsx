@@ -4,6 +4,7 @@ import { PublicityReviewPanel } from "./PublicityReviewPanel";
 import { OperationsDrillPanel } from "./OperationsDrillPanel";
 import { MarketStreamStatusPanel } from "./MarketStreamStatusPanel";
 import { ShadowSoakPanel } from "./ShadowSoakPanel";
+import { CloudSoakStatusPanel } from "./CloudSoakStatusPanel";
 
 type WorkspacePreferences = { displayTimezone: "Asia/Seoul" | "America/New_York" | "UTC"; quietHoursStart: number; quietHoursEnd: number; staleAfterSeconds: number; notifyWarning: boolean; notifyCritical: boolean };
 type DashboardSnapshot = { observedAtMs: number; sourceTimestampsMs: Record<string, number>; counts: Record<string, number>; liveOrderEnabled: false; warnings: string[] };
@@ -52,6 +53,7 @@ export function OperationalReadinessPanel() {
         return <div className="readiness-row" key={calendar.market}><b>{calendar.market} · {calendar.holiday ? "휴장" : active ? `${active.name} 운영 중` : "장외 시간"}</b><span>{calendar.sessions.map((session) => `${session.name} ${new Date(session.startTime).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" })}–${new Date(session.endTime).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" })}`).join(" · ") || "오늘 운영 세션 없음"}</span><small>{calendar.date} · 다음 영업일 {calendar.nextBusinessDay} · {calendar.provider}</small></div>;
       }) : <p>토스증권 연결 후 공식 KR·US 장 운영 시간을 확인합니다. 고정 시간표를 추정하지 않습니다.</p>}</article>
       <MarketStreamStatusPanel />
+      <CloudSoakStatusPanel />
       <ShadowSoakPanel />
       <OperationsDrillPanel onMessage={setMessage} onError={setError} />
       <PublicityReviewPanel onMessage={setMessage} onError={setError} />

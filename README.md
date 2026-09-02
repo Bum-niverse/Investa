@@ -98,12 +98,14 @@ Windows에서 Tauri를 빌드하려면 Microsoft C++ Build Tools와 WebView2가 
 
 ```powershell
 pnpm install
-pnpm tauri dev
+pnpm desktop:start
 ```
 
-바탕화면 `Investa` 바로가기는 [`scripts/launch_investa.ps1`](scripts/launch_investa.ps1)을 사용합니다. release가 현재 소스보다 오래된 경우에만 설치 패키지 생성 없이 증분 빌드한 뒤 실행하며, 자세한 동작과 오류 로그 위치는 [데스크톱 런처](docs/desktop-launcher.md)에 정리했습니다.
+`pnpm desktop:start`와 바탕화면 `Investa` 바로가기는 [`scripts/launch_investa.ps1`](scripts/launch_investa.ps1)을 사용합니다. release가 현재 소스보다 오래된 경우에만 설치 패키지 생성 없이 증분 빌드한 뒤 실행합니다. 패키지 앱은 내장 `frontendDist`를 사용하므로 localhost가 필요하지 않습니다. 개발 서버가 필요한 경우에만 `pnpm tauri dev`를 사용합니다. 자세한 동작과 오류 로그 위치는 [데스크톱 런처](docs/desktop-launcher.md)에 정리했습니다.
 
 브라우저 UI만 확인하려면 `pnpm dev`를 실행합니다.
+
+Cloud Run의 시장 스트림·내부 섀도우 24시간 검사는 `pnpm cloud:soak:collect`로 읽기 전용 상태 캐시를 갱신합니다. Google Cloud CLI 로그인은 앱 밖에서 관리하며, 앱의 `운영 준비·근거·복구` 화면은 `%APPDATA%\com.bumniverse.investa\audits\cloud-soak-status.json`의 제한된 요약만 읽습니다. 원본 Cloud 로그, OAuth 토큰과 금융 자격정보는 앱에 전달하지 않습니다. 로컬에 `gcloud`가 없거나 로그인되지 않은 경우에는 성공으로 추정하지 않고 수집 불가로 표시합니다.
 
 ## 검증
 

@@ -17,6 +17,16 @@ type WorkspaceIdentityStatus = {
   linkedAccountCount: number;
 };
 
+type WorkspaceLifecyclePolicy = {
+  recoveryProviders: string[];
+  canUnlinkConnectedProvider: boolean;
+  canDeleteWorkspace: false;
+  deletionRequiresExplicitConfirmation: true;
+  retainedOnAccountUnlink: string[];
+  deletedOnWorkspaceDeletion: string[];
+  message: string;
+};
+
 const EMPTY_STATUS: SocialAuthStatus = {
   googleConfigured: false,
   googleSecretConfigured: false,
@@ -38,6 +48,7 @@ const providerLabel = (provider?: string | null) => ({ github: "GitHub", google:
 export function SocialLoginSettings({ open }: { open: boolean }) {
   const [status, setStatus] = useState(EMPTY_STATUS);
   const [identityStatus, setIdentityStatus] = useState(EMPTY_IDENTITY_STATUS);
+  const [lifecyclePolicy, setLifecyclePolicy] = useState<WorkspaceLifecyclePolicy | null>(null);
   const [clientId, setClientId] = useState("");
   const [clientSecret, setClientSecret] = useState("");
   const [busy, setBusy] = useState(false);
@@ -46,12 +57,14 @@ export function SocialLoginSettings({ open }: { open: boolean }) {
   const refresh = useCallback(async () => {
     if (!isTauri()) return;
     try {
-      const [social, identity] = await Promise.all([
+      const [social, identity, lifecycle] = await Promise.all([
         invoke<SocialAuthStatus>("social_auth_status"),
         invoke<WorkspaceIdentityStatus>("workspace_identity_status"),
+        invoke<WorkspaceLifecyclePolicy>("workspace_identity_lifecycle_policy"),
       ]);
       setStatus(social);
       setIdentityStatus(identity);
+      setLifecyclePolicy(lifecycle);
     } catch (reason) {
       setMessage(String(reason));
     }
@@ -108,6 +121,22 @@ export function SocialLoginSettings({ open }: { open: boolean }) {
     }
   };
 
+  const unlinkProvider = async (provider: string) => {
+    const confirmation = `${providerLabel(provider)} 연결 해제`;
+    if (!window.confirm(`${providerLabel(provider)} 연결을 해제합니다. 로컬 분석·모의원장 기록은 삭제되지 않습니다.`)) return;
+    setBusy(true);
+    setMessage(null);
+    try {
+      setIdentityStatus(await invoke<WorkspaceIdentityStatus>("workspace_identity_unlink_provider", { provider, confirmation }));
+      await refresh();
+      setMessage(`${providerLabel(provider)} 연결을 해제했습니다. 로컬 작업공간 데이터는 유지됩니다.`);
+    } catch (reason) {
+      setMessage(String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return <div className="social-login-settings">
     <section className="workspace-identity-settings">
       <header><div><span>WORKSPACE OWNER</span><strong>작업공간 소유자와 연결 계정</strong></div><b>{identityStatus.initialized ? "소유자 고정" : "첫 로그인 대기"}</b></header>
@@ -115,13 +144,14 @@ export function SocialLoginSettings({ open }: { open: boolean }) {
         ? `주 소유자: ${providerLabel(identityStatus.primaryProvider)} · 연결 계정 ${identityStatus.linkedAccountCount}개`
         : "처음 검증된 로그인 계정이 이 로컬 작업공간의 소유자가 됩니다."}</p>
       {identityStatus.linkedProviders.length > 0 && <ul aria-label="연결된 로그인 공급자">
-        {identityStatus.linkedProviders.map((provider) => <li key={provider}>✓ {providerLabel(provider)} 연결됨</li>)}
+        {identityStatus.linkedProviders.map((provider) => <li key={provider}>✓ {providerLabel(provider)} 연결됨 {provider !== identityStatus.primaryProvider && <button type="button" disabled={busy || !lifecyclePolicy?.canUnlinkConnectedProvider} onClick={() => void unlinkProvider(provider)}>연결 해제</button>}</li>)}
       </ul>}
       <div className="workspace-link-actions">
         <button type="button" onClick={() => void linkAccount("github")} disabled={busy || !identityStatus.sessionAuthenticated}>현재 GitHub CLI 계정 연결</button>
         <button type="button" onClick={() => void linkAccount("google")} disabled={busy || !identityStatus.sessionAuthenticated || !status.googleConfigured}>Google 계정 연결</button>
       </div>
       <small>{identityStatus.sessionAuthenticated ? "현재 소유자 세션에서 새 계정을 연결할 수 있습니다." : "계정 연결은 소유자로 로그인한 세션에서만 가능합니다."} 연결하지 않은 계정은 같은 Windows 사용자여도 이 작업공간을 열 수 없습니다.</small>
+      {lifecyclePolicy && <details><summary>복구·탈퇴 시 데이터 처리</summary><p>{lifecyclePolicy.message}</p><strong>계정 연결 해제 후 유지</strong><ul>{lifecyclePolicy.retainedOnAccountUnlink.map((item) => <li key={item}>{item}</li>)}</ul><strong>향후 작업공간 삭제 대상</strong><ul>{lifecyclePolicy.deletedOnWorkspaceDeletion.map((item) => <li key={item}>{item}</li>)}</ul><small>복구는 현재 연결된 {lifecyclePolicy.recoveryProviders.map(providerLabel).join(" · ") || "계정 없음"} 중 하나의 재인증만 허용합니다. 지원팀·이메일 문자열만으로 우회하지 않습니다.</small></details>}
     </section>
     <details className="social-login-advanced">
       <summary>개발자용 OAuth 설정</summary>

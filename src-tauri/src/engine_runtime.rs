@@ -52,6 +52,8 @@ pub struct EngineRunRequest {
 #[serde(rename_all = "camelCase")]
 pub struct EngineRunReport {
     pub run_id: String,
+    #[serde(default)]
+    pub analysis_ids: Vec<String>,
     pub status: String,
     pub symbol: String,
     pub market: String,
@@ -206,6 +208,7 @@ fn evaluate(request: &EngineRunRequest, created_at_ms: u64) -> Result<EngineRunR
     let candidate_ready = blockers.is_empty();
     Ok(EngineRunReport {
         run_id: request.run_id.clone(),
+        analysis_ids: request.analysis_ids.clone(),
         status: if candidate_ready {
             "completed"
         } else {

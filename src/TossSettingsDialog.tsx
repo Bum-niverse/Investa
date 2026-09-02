@@ -6,6 +6,7 @@ import { INTEGRATION_CATALOG, supportLabel } from "./integrationCatalog";
 import { BinanceConnectionPanel, type BinanceAccountSnapshot, type BinanceConnectionStatus } from "./BinanceConnectionPanel";
 import { TelegramConnectionPanel, type TelegramConnectionStatus } from "./TelegramConnectionPanel";
 import { AiProviderConnections, type CodexConnectionStatus } from "./AiProviderConnections";
+import { OfficialKrDataSettings } from "./OfficialKrDataSettings";
 import { CONNECTION_LEGEND, connectionTone, type ConnectionTone } from "./connectionStatus";
 import { summarizeConnectionRefresh, type ConnectionProbeResult, type ConnectionRefreshSummary } from "./connectionRefresh";
 import { SocialLoginSettings } from "./SocialLoginSettings";
@@ -746,6 +747,7 @@ export function TossSettingsDialog({ open, onClose, onSnapshot, onPaperAccount }
           </SettingsFold>
           <SettingsFold eyebrow="AI PROVIDERS" title="분석 모델 연결" status={codexStatus?.connected ? "Codex 연결됨" : "사용자 설정 필요"} statusTone={connectionTone(Boolean(codexStatus?.connected))}>
           <AiProviderConnections open={open} codexStatus={codexStatus} />
+          <OfficialKrDataSettings open={open} />
           </SettingsFold>
         </footer>
       </div>

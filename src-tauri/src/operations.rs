@@ -920,11 +920,24 @@ pub fn shadow_watch_arm(
     request: ShadowWatchRequest,
     persistence: State<'_, PersistenceBridge>,
 ) -> Result<ShadowRuntimeStatus, String> {
-    load_experiment(&persistence, &request.experiment_id)
+    arm_shadow_watch(
+        &persistence,
+        &request.experiment_id,
+        request.interval_seconds,
+    )?;
+    shadow_runtime_status(persistence)
+}
+
+pub(crate) fn arm_shadow_watch(
+    persistence: &PersistenceBridge,
+    experiment_id: &str,
+    interval_seconds: Option<u64>,
+) -> Result<(), String> {
+    load_experiment(persistence, experiment_id)
         .and_then(|experiment| validate_experiment(&experiment))?;
-    let interval = request.interval_seconds.unwrap_or(60).clamp(15, 86_400);
+    let interval = interval_seconds.unwrap_or(60).clamp(15, 86_400);
     let now = persistence::now_ms()?;
-    let watch_id = format!("watch-{}", request.experiment_id);
+    let watch_id = format!("watch-{experiment_id}");
     let connection = persistence
         .connection
         .lock()
@@ -932,9 +945,8 @@ pub fn shadow_watch_arm(
     connection.execute("INSERT INTO shadow_watches (watch_id, experiment_id, enabled, interval_seconds, status, created_at_ms, updated_at_ms)
         VALUES (?1, ?2, 1, ?3, 'watching', ?4, ?4)
         ON CONFLICT(watch_id) DO UPDATE SET enabled = 1, interval_seconds = excluded.interval_seconds, status = 'watching', last_error = NULL, updated_at_ms = excluded.updated_at_ms",
-        params![watch_id, request.experiment_id, interval, now]).map_err(|error| format!("섀도우 감시를 시작하지 못했습니다: {error}"))?;
-    drop(connection);
-    shadow_runtime_status(persistence)
+        params![watch_id, experiment_id, interval, now]).map_err(|error| format!("섀도우 감시를 시작하지 못했습니다: {error}"))?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -979,7 +991,7 @@ fn shadow_watch_is_due(watch: &ShadowWatch, now: u64) -> bool {
             .is_none_or(|last| now.saturating_sub(last) >= watch.interval_seconds * 1_000)
 }
 
-async fn run_shadow_engine_once(
+pub(crate) async fn run_shadow_engine_once(
     market: &MarketDataBridge,
     crypto: &CryptoMarketBridge,
     persistence: &PersistenceBridge,

@@ -1,15 +1,26 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
+    fs::{self, File, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+    thread,
+    time::Duration,
 };
 
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 
-use crate::persistence::{now_ms, PersistenceBridge};
+use crate::{
+    persistence::{now_ms, PersistenceBridge},
+    runtime_ops,
+};
 
 const MAX_TEXT_LEN: usize = 8_000;
+const MAX_CLOUD_SOAK_REPORT_BYTES: u64 = 256 * 1024;
+const HEADLESS_SHADOW_SOAK_ARG: &str = "--shadow-soak-autostart";
+const HEADLESS_SHADOW_SOAK_DURATION_MS: u64 = 86_400_000;
+const HEADLESS_SHADOW_SOAK_SAMPLE_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -33,6 +44,152 @@ impl Default for WorkspacePreferences {
             notify_critical: true,
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CloudSoakStreamCounters {
+    pub messages: u64,
+    pub reconnects: u64,
+    pub errors: u64,
+    pub transport_timeouts: u64,
+    pub market_gap_events: u64,
+    pub last_message_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CloudSoakHeartbeat {
+    #[serde(default)]
+    pub streams: BTreeMap<String, CloudSoakStreamCounters>,
+    #[serde(default)]
+    pub event_count: u64,
+    #[serde(default)]
+    pub ledger_count: u64,
+    #[serde(default)]
+    pub failure_count: u64,
+    #[serde(default)]
+    pub reconciliation_passed: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CloudSoakJobStatus {
+    pub mode: String,
+    pub job_name: String,
+    pub execution_name: Option<String>,
+    pub state: String,
+    pub started_at_ms: Option<u64>,
+    pub completed_at_ms: Option<u64>,
+    pub elapsed_ms: Option<u64>,
+    pub latest_heartbeat_at_ms: Option<u64>,
+    pub heartbeat: Option<CloudSoakHeartbeat>,
+    pub passed: Option<bool>,
+    pub actual_elapsed24h_qualified: bool,
+    pub issues: Vec<String>,
+    pub warnings: Vec<String>,
+    pub collection_issue: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CloudSoakReport {
+    pub schema: String,
+    pub collected_at_ms: u64,
+    pub project_id: String,
+    pub region: String,
+    pub source: String,
+    pub status: String,
+    pub live_order_enabled: bool,
+    pub jobs: Vec<CloudSoakJobStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudSoakReportSnapshot {
+    pub available: bool,
+    pub report: Option<CloudSoakReport>,
+    pub issue: Option<String>,
+}
+
+fn validate_cloud_soak_report(report: &CloudSoakReport) -> Result<(), String> {
+    if report.schema != "investa.cloud-soak-report.v1"
+        || report.project_id != "investa-remote-bumniverse"
+        || report.region != "asia-northeast3"
+        || report.source != "gcloud-read-only"
+        || report.live_order_enabled
+        || report.jobs.len() > 4
+        || !matches!(
+            report.status.as_str(),
+            "unavailable" | "running" | "warning" | "failed" | "completed"
+        )
+    {
+        return Err("Cloud Run 검사 캐시의 보안 경계 또는 스키마가 올바르지 않습니다.".to_owned());
+    }
+    for job in &report.jobs {
+        if !matches!(job.mode.as_str(), "market" | "shadow-contract")
+            || !matches!(
+                job.state.as_str(),
+                "unavailable" | "running" | "failed" | "completed"
+            )
+            || job.job_name.len() > 128
+            || job
+                .execution_name
+                .as_ref()
+                .is_some_and(|value| value.len() > 128)
+            || job.issues.len() > 50
+            || job.warnings.len() > 50
+            || job
+                .issues
+                .iter()
+                .chain(job.warnings.iter())
+                .any(|value| value.len() > 1_000)
+            || job
+                .heartbeat
+                .as_ref()
+                .is_some_and(|heartbeat| heartbeat.streams.len() > 12)
+        {
+            return Err("Cloud Run 검사 작업 캐시가 허용 범위를 벗어났습니다.".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn read_cloud_soak_report(path: &Path) -> Result<CloudSoakReportSnapshot, String> {
+    if !path.exists() {
+        return Ok(CloudSoakReportSnapshot {
+            available: false,
+            report: None,
+            issue: Some(
+                "저장된 Cloud Run 검사 결과가 없습니다. 읽기 전용 수집기를 먼저 실행하세요."
+                    .to_owned(),
+            ),
+        });
+    }
+    let metadata = fs::metadata(path)
+        .map_err(|error| format!("Cloud Run 검사 캐시 크기를 확인하지 못했습니다: {error}"))?;
+    if metadata.len() > MAX_CLOUD_SOAK_REPORT_BYTES {
+        return Err("Cloud Run 검사 캐시가 256KB 제한을 초과했습니다.".to_owned());
+    }
+    let raw = fs::read_to_string(path)
+        .map_err(|error| format!("Cloud Run 검사 캐시를 읽지 못했습니다: {error}"))?;
+    let report: CloudSoakReport = serde_json::from_str(&raw)
+        .map_err(|_| "Cloud Run 검사 캐시 형식이 올바르지 않습니다.".to_owned())?;
+    validate_cloud_soak_report(&report)?;
+    Ok(CloudSoakReportSnapshot {
+        available: true,
+        report: Some(report),
+        issue: None,
+    })
+}
+
+#[tauri::command]
+pub fn cloud_soak_report_snapshot(app: AppHandle) -> Result<CloudSoakReportSnapshot, String> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("앱 데이터 경로를 확인하지 못했습니다: {error}"))?;
+    read_cloud_soak_report(&app_data_dir.join("audits").join("cloud-soak-status.json"))
 }
 
 fn validate_preferences(value: &WorkspacePreferences) -> Result<(), String> {
@@ -690,6 +847,174 @@ pub struct StoredSoakAudit {
     pub created_at_ms: u64,
 }
 
+fn has_headless_shadow_soak_arg<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    args.into_iter()
+        .any(|value| value.as_ref() == std::ffi::OsStr::new(HEADLESS_SHADOW_SOAK_ARG))
+}
+
+pub fn headless_shadow_soak_requested() -> bool {
+    has_headless_shadow_soak_arg(std::env::args_os())
+}
+
+pub struct HeadlessShadowSoakGuard {
+    lock: File,
+    lock_path: PathBuf,
+}
+
+pub fn acquire_headless_shadow_soak(
+    app_data_dir: &Path,
+) -> Result<Option<HeadlessShadowSoakGuard>, String> {
+    let audit_dir = app_data_dir.join("audits");
+    fs::create_dir_all(&audit_dir)
+        .map_err(|error| format!("내부 섀도우 감사 폴더를 만들지 못했습니다: {error}"))?;
+    let lock_path = audit_dir.join("shadow-soak-24h.lock");
+    let mut lock = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+    {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "내부 섀도우 내구 검사 잠금 파일을 만들 수 없습니다: {error}"
+            ))
+        }
+    };
+    if let Err(error) = writeln!(lock, "{}", std::process::id()).and_then(|_| lock.flush()) {
+        drop(lock);
+        remove_lock(&lock_path);
+        return Err(format!(
+            "내부 섀도우 잠금 정보를 기록하지 못했습니다: {error}"
+        ));
+    }
+    Ok(Some(HeadlessShadowSoakGuard { lock, lock_path }))
+}
+
+fn append_json_line<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| format!("내부 섀도우 진행 로그를 열지 못했습니다: {error}"))?;
+    serde_json::to_writer(&mut file, value)
+        .map_err(|error| format!("내부 섀도우 진행 로그를 직렬화하지 못했습니다: {error}"))?;
+    file.write_all(b"\n")
+        .and_then(|_| file.flush())
+        .map_err(|error| format!("내부 섀도우 진행 로그를 기록하지 못했습니다: {error}"))
+}
+
+fn write_json_atomically<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    let temporary = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec_pretty(value)
+        .map_err(|error| format!("내부 섀도우 결과를 직렬화하지 못했습니다: {error}"))?;
+    fs::write(&temporary, bytes)
+        .map_err(|error| format!("내부 섀도우 임시 결과를 기록하지 못했습니다: {error}"))?;
+    if path.exists() {
+        fs::remove_file(path)
+            .map_err(|error| format!("이전 내부 섀도우 결과를 교체하지 못했습니다: {error}"))?;
+    }
+    fs::rename(&temporary, path)
+        .map_err(|error| format!("내부 섀도우 결과를 확정하지 못했습니다: {error}"))
+}
+
+fn remove_lock(path: &Path) {
+    let _ = fs::remove_file(path);
+}
+
+pub fn start_headless_shadow_soak(
+    app: AppHandle,
+    app_data_dir: PathBuf,
+    guard: HeadlessShadowSoakGuard,
+) -> Result<(), String> {
+    let audit_dir = app_data_dir.join("audits");
+    let HeadlessShadowSoakGuard { lock, lock_path } = guard;
+
+    let initialized = (|| -> Result<_, String> {
+        let started_at_ms = now_ms()?;
+        let run_id = format!("shadow-soak-{started_at_ms}");
+        let progress_path = audit_dir.join(format!("{run_id}.jsonl"));
+        let result_path = audit_dir.join(format!("{run_id}.result.json"));
+        let error_path = audit_dir.join(format!("{run_id}.stderr.log"));
+        let first_sample = {
+            let bridge = app.state::<PersistenceBridge>();
+            runtime_ops::reconcile_for_shadow_soak(&bridge)?;
+            runtime_ops::refresh_local_health_for_shadow_soak(&bridge)?;
+            collect_soak_sample(SoakSampleRequest { restarted: false }, &bridge)?
+        };
+        append_json_line(&progress_path, &first_sample)?;
+        Ok((
+            started_at_ms,
+            run_id,
+            progress_path,
+            result_path,
+            error_path,
+            first_sample,
+        ))
+    })();
+    let (started_at_ms, run_id, progress_path, result_path, error_path, first_sample) =
+        match initialized {
+            Ok(value) => value,
+            Err(error) => {
+                drop(lock);
+                remove_lock(&lock_path);
+                return Err(error);
+            }
+        };
+    let mut samples = Vec::with_capacity(1_500);
+    samples.push(first_sample);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let lock_guard = lock;
+        let result = (|| -> Result<(), String> {
+            loop {
+                thread::sleep(HEADLESS_SHADOW_SOAK_SAMPLE_INTERVAL);
+                let mut sample = {
+                    let bridge = app.state::<PersistenceBridge>();
+                    runtime_ops::refresh_local_health_for_shadow_soak(&bridge)?;
+                    collect_soak_sample(SoakSampleRequest { restarted: false }, &bridge)?
+                };
+                if sample.candidate_key.as_ref().is_some_and(|key| {
+                    samples
+                        .iter()
+                        .any(|existing| existing.candidate_key.as_ref() == Some(key))
+                }) {
+                    sample.candidate_key = None;
+                }
+                append_json_line(&progress_path, &sample)?;
+                let elapsed_ms = sample.observed_at_ms.saturating_sub(started_at_ms);
+                samples.push(sample);
+                if elapsed_ms >= HEADLESS_SHADOW_SOAK_DURATION_MS {
+                    let stored = {
+                        let bridge = app.state::<PersistenceBridge>();
+                        save_soak_audit(
+                            SaveSoakAuditRequest {
+                                run_id: run_id.clone(),
+                                samples,
+                                simulated_timeline: false,
+                            },
+                            &bridge,
+                        )?
+                    };
+                    write_json_atomically(&result_path, &stored)?;
+                    return Ok(());
+                }
+            }
+        })();
+        if let Err(error) = result {
+            let _ = fs::write(&error_path, format!("{error}\n"));
+        }
+        drop(lock_guard);
+        remove_lock(&lock_path);
+        app.exit(0);
+    });
+    Ok(())
+}
+
 fn valid_run_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
@@ -844,6 +1169,100 @@ pub fn operations_dashboard_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cloud_soak_cache_is_fixed_schema_and_live_order_stays_locked() {
+        let root = std::env::temp_dir().join(format!(
+            "investa-cloud-soak-cache-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&root).expect("cache test directory");
+        let path = root.join("cloud-soak-status.json");
+        fs::write(
+            &path,
+            r#"{
+              "schema":"investa.cloud-soak-report.v1",
+              "collectedAtMs":1788307200000,
+              "projectId":"investa-remote-bumniverse",
+              "region":"asia-northeast3",
+              "source":"gcloud-read-only",
+              "status":"running",
+              "liveOrderEnabled":false,
+              "jobs":[{
+                "mode":"market","jobName":"investa-market-soak-24h-v2","executionName":"execution-1",
+                "state":"running","startedAtMs":1788307200000,"completedAtMs":null,"elapsedMs":60000,
+                "latestHeartbeatAtMs":1788307260000,
+                "heartbeat":{"streams":{"upbit_spot":{"messages":10,"reconnects":0,"errors":0,"transportTimeouts":0,"marketGapEvents":0,"lastMessageAtMs":1788307260000}}},
+                "passed":null,"actualElapsed24hQualified":false,"issues":[],"warnings":[],"collectionIssue":null
+              }]
+            }"#,
+        )
+        .expect("write cache fixture");
+        let snapshot = read_cloud_soak_report(&path).expect("read cache");
+        assert!(snapshot.available);
+        let report = snapshot.report.expect("report");
+        assert!(!report.live_order_enabled);
+        assert_eq!(
+            report.jobs[0]
+                .heartbeat
+                .as_ref()
+                .expect("heartbeat")
+                .streams["upbit_spot"]
+                .messages,
+            10
+        );
+        fs::remove_dir_all(root).expect("remove cache test directory");
+    }
+
+    #[test]
+    fn cloud_soak_cache_rejects_unknown_fields_and_live_order_enablement() {
+        let report: CloudSoakReport = serde_json::from_str(r#"{
+          "schema":"investa.cloud-soak-report.v1","collectedAtMs":1,"projectId":"investa-remote-bumniverse",
+          "region":"asia-northeast3","source":"gcloud-read-only","status":"running","liveOrderEnabled":true,"jobs":[]
+        }"#).expect("parse bounded schema");
+        assert!(validate_cloud_soak_report(&report).is_err());
+        assert!(serde_json::from_str::<CloudSoakReport>(r#"{
+          "schema":"investa.cloud-soak-report.v1","collectedAtMs":1,"projectId":"investa-remote-bumniverse",
+          "region":"asia-northeast3","source":"gcloud-read-only","status":"running","liveOrderEnabled":false,"jobs":[],"token":"forbidden"
+        }"#).is_err());
+    }
+
+    #[test]
+    fn headless_shadow_soak_requires_an_explicit_exact_flag() {
+        assert!(has_headless_shadow_soak_arg([
+            "investa",
+            "--shadow-soak-autostart"
+        ]));
+        assert!(!has_headless_shadow_soak_arg(["investa"]));
+        assert!(!has_headless_shadow_soak_arg([
+            "investa",
+            "--shadow-soak-autostart=true"
+        ]));
+    }
+
+    #[test]
+    fn headless_shadow_soak_lock_is_acquired_before_database_startup() {
+        let root = std::env::temp_dir().join(format!(
+            "investa-shadow-soak-lock-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let guard = acquire_headless_shadow_soak(&root)
+            .expect("lock acquisition")
+            .expect("first runner should acquire the lock");
+        assert!(acquire_headless_shadow_soak(&root)
+            .expect("duplicate lock check")
+            .is_none());
+        assert_eq!(
+            fs::read_to_string(&guard.lock_path)
+                .expect("lock pid")
+                .trim(),
+            std::process::id().to_string()
+        );
+        let lock_path = guard.lock_path.clone();
+        drop(guard);
+        remove_lock(&lock_path);
+        fs::remove_dir_all(root).expect("remove lock test directory");
+    }
 
     #[test]
     fn market_rules_reject_wrong_currency_and_lot() {

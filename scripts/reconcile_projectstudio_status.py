@@ -316,7 +316,7 @@ PARTIAL_CHECKS: dict[str, set[int]] = {
     "feat-stages-live-approval": {0, 2},
     "feat-crypto-risk-gate": {0, 1, 2},
     "feat-records-backend-implementation-roadmap": {1, 2, 3, 4, 5, 6, 7, 8, 9, 10},
-    "feat-records-external-integration-priority": {0, 1, 2, 3, 4, 6, 7},
+    "feat-records-external-integration-priority": {0, 1, 2, 3, 4, 5, 6, 7},
     "org-execution": {0},
     "org-public-relations": {1},
     "org-compliance-audit": {0, 2},
@@ -331,6 +331,7 @@ PARTIAL_CHECKS: dict[str, set[int]] = {
     "role-crypto-operations-monitor": {0, 2},
     "feat-crypto-paper-terminal-provider": {0, 1, 2},
     "feat-forecast-foundation-model-adapters": {1},
+    "feat-data-ingestion": {0, 1},
 }
 
 NEW_DONE_ALL = {
@@ -348,15 +349,127 @@ NEW_PARTIAL_CHECKS: dict[str, set[int]] = {
 }
 
 
-FLOW_COMPLETED_IDS = {
-    "flow-meeting-analysis-cycle-phase",
-    "flow-meeting-analysis-cycle-6",
-    "flow-meeting-analysis-cycle-7",
-    "flow-remote-2",
-    "flow-remote-3",
-    "flow-remote-4",
-    "flow-research-1",
+FLOW_COMPLETION_OVERRIDES = {
+    "flow-meeting-analysis-cycle-phase": False,
+    "flow-meeting-analysis-cycle-1": True,
+    "flow-meeting-analysis-cycle-symbol": True,
+    "flow-meeting-analysis-cycle-preflight": True,
+    "flow-meeting-analysis-cycle-evidence": True,
+    "flow-meeting-analysis-cycle-2": True,
+    "flow-meeting-analysis-cycle-3": True,
+    "flow-meeting-analysis-cycle-4": True,
+    "flow-meeting-analysis-cycle-5": True,
+    "flow-meeting-analysis-cycle-6": True,
+    "flow-meeting-analysis-cycle-save": True,
+    "flow-meeting-analysis-cycle-risk": True,
+    # 고정 fixture로 분석→백테스트→후보→사용자 승인→append-only 원장까지 자동
+    # 골든패스가 통과한다. 실제 공급자 신호와 장시간 섀도우 증거가 필요한 전체
+    # 레인·후보 생성·감시 단계는 과장하지 않고 미완료로 유지한다.
+    "flow-meeting-analysis-cycle-7": False,
+    "flow-meeting-analysis-cycle-approval": True,
+    "flow-meeting-analysis-cycle-execution": True,
+    "flow-meeting-analysis-cycle-ledger": True,
+    "flow-meeting-analysis-cycle-shadow": False,
+    "flow-meeting-analysis-cycle-symbol-error": True,
+    "flow-meeting-analysis-cycle-provider-error": True,
+    "flow-meeting-analysis-cycle-partial-failure": True,
+    "flow-meeting-analysis-cycle-codex-recovery": False,
+    "flow-meeting-analysis-cycle-risk-rejected": True,
+    "flow-meeting-analysis-cycle-duplicate": True,
+    "flow-remote-2": True,
+    "flow-remote-3": True,
+    "flow-remote-4": True,
+    "flow-research-1": True,
 }
+
+
+def meeting_flow_nodes() -> list[dict[str, Any]]:
+    lane_id = "lane-meeting-analysis-cycle"
+
+    def node(
+        node_id: str,
+        title: str,
+        description: str,
+        kind: str,
+        x: float,
+        y: float,
+        linked_feature_ids: list[str],
+        *,
+        branch_condition: str | None = None,
+        code_paths: list[str] | None = None,
+        test_paths: list[str] | None = None,
+        completion_criteria: str = "",
+    ) -> dict[str, Any]:
+        return {
+            "id": node_id,
+            "laneId": lane_id,
+            "title": title,
+            "description": description,
+            "kind": kind,
+            "positionX": x,
+            "positionY": y,
+            "colorKey": "cyan",
+            "depth": None,
+            "parentId": None,
+            "linkedFeatureIds": linked_feature_ids,
+            "branchCondition": branch_condition,
+            "inputArtifacts": [],
+            "outputArtifacts": [],
+            "methods": [],
+            "validation": "",
+            "failureHandling": "",
+            "codePaths": code_paths or [],
+            "testPaths": test_paths or [],
+            "completionCriteria": completion_criteria,
+            "isCompleted": FLOW_COMPLETION_OVERRIDES[node_id],
+        }
+
+    main_y = 4380.0
+    branch_y = 4490.0
+    return [
+        node("flow-meeting-analysis-cycle-phase", "분석 요청부터 내부 모의원장까지", "사용자 분석 요청이 근거 수집·부서 회의·위험 심사·사용자 승인·내부 모의체결·원장 반영으로 이어지는 전체 사용 흐름이다.", "phase", 20, main_y, ["req-trading-room", "req-risk", "req-execution"], completion_criteria="분석 회의에서 생성된 후보가 사용자 승인 뒤 내부 원장과 성과 화면에 한 번만 반영되고 재시작 후 재생된다."),
+        node("flow-meeting-analysis-cycle-1", "분석 안건 입력", "사용자가 종목·시장·보유 포지션·투자 판단 요청을 자연어로 입력한다.", "screen", 250, main_y, ["feat-trading-room-openai"], code_paths=["src/App.tsx"]),
+        node("flow-meeting-analysis-cycle-symbol", "종목·보유 포지션 식별", "종목명·티커를 하나의 상장 법인과 시장으로 확정하고 연결 계좌의 익명화된 보유 수량·평단을 같은 기준 시각으로 찾는다.", "decision", 480, main_y, ["feat-broker-symbol-autocomplete", "feat-meeting-evidence-pack"], branch_condition="하나의 종목과 포지션을 확정하면 연결 사전점검으로 진행", code_paths=["src/meetingEvidence.ts", "src-tauri/src/market_data.rs"], test_paths=["scripts/meetingEvidence.test.ts", "scripts/analysisSnapshotRouting.test.ts"]),
+        node("flow-meeting-analysis-cycle-preflight", "데이터 연결·신선도 사전점검", "시장가격·계좌·재무·공시·뉴스·Telegram 공급자의 설정, 기준 시각, 결측과 stale 상태를 분석 전에 확인한다.", "decision", 710, main_y, ["feat-official-news-community-adapters", "feat-analysis-point-in-time-price-snapshot"], branch_condition="필수 근거가 준비되면 수집, 아니면 결측을 명시하고 보류·부분 분석", code_paths=["src/connectionStatus.ts", "src-tauri/src/market_data.rs"], test_paths=["scripts/connectionStatus.test.ts", "scripts/meetingEvidence.test.ts"]),
+        node("flow-meeting-analysis-cycle-evidence", "PIT 근거 묶음 수집", "현재가·차트·기술지표·익명화 포지션·재무·공시·뉴스·선택 Telegram을 한 번 수집하고 근거 ID와 관측 시각을 고정한다.", "action", 940, main_y, ["feat-meeting-evidence-pack", "feat-data-evidence-normalization"], code_paths=["src/meetingEvidence.ts", "src-tauri/src/market_data.rs"], test_paths=["scripts/meetingEvidence.test.ts"]),
+        node("flow-meeting-analysis-cycle-2", "관련 부서 자동 선택·소집", "안건을 분류해 필요한 부서만 소집하고 위험·감사처럼 필수 안전 부서를 결정론적으로 보강한다.", "action", 1170, main_y, ["feat-trading-room-department-result-aggregation"], code_paths=["src-tauri/src/codex.rs", "src/App.tsx"]),
+        node("flow-meeting-analysis-cycle-3", "직원별 역할 한정 분석", "선택 부서의 직원들이 같은 근거 묶음을 사용해 자기 역할 범위의 보고만 생성한다.", "action", 1400, main_y, ["feat-trading-room-role-scoped-task", "feat-codex-analysis-quality-profile"], code_paths=["src-tauri/src/codex.rs", "src/meetingEvidence.ts"], test_paths=["scripts/meetingEvidence.test.ts"]),
+        node("flow-meeting-analysis-cycle-4", "완료 부서장부터 복귀", "실제 직원 완료 상태의 평균이 100%인 부서장부터 본부장실로 복귀하고 미완료 부서는 계속 작업한다.", "action", 1630, main_y, ["feat-trading-room-active-work-indicators"], code_paths=["src/App.tsx"]),
+        node("flow-meeting-analysis-cycle-5", "부장 보고·이견 확인", "부장은 직원 보고만 종합하고 Bull·Bear·위험·데이터 결측과 근거 ID를 회의 패널에 표시한다.", "screen", 1860, main_y, ["feat-trading-room-department-result-aggregation"]),
+        node("flow-meeting-analysis-cycle-6", "본부장 최종 종합", "본부장은 동일 원본 근거와 부서 보고를 재대조해 후보·보류·기각 및 확신도 근거를 구조화한다.", "decision", 2090, main_y, ["feat-codex-analysis-quality-profile"], code_paths=["src-tauri/src/codex.rs"]),
+        node("flow-meeting-analysis-cycle-save", "분석 보관함 저장", "요청·완료 시각, 시장, 종목, 보고 상태, 근거와 차트 주석을 불변 분석 기록으로 저장한다.", "result", 2320, main_y, ["feat-analysis-generic-records", "feat-research-analysis-vault"], code_paths=["src-tauri/src/persistence.rs", "src/AnalysisWorkspace.tsx"]),
+        node("flow-meeting-analysis-cycle-risk", "결정론적 위험 게이트", "LLM과 분리된 코드가 신선도·유동성·손실 한도·중복 주문·실전 잠금을 판정한다.", "decision", 2550, main_y, ["feat-risk-pretrade", "feat-risk-market-safety"], branch_condition="모든 안전 조건을 통과한 경우에만 내부 모의주문 후보 생성", code_paths=["src-tauri/src/execution_control.rs", "src-tauri/src/trading.rs"]),
+        node("flow-meeting-analysis-cycle-7", "백테스트·신호 감시·후보 또는 보류", "회의 분석 ID와 단일 종목·지원 전략을 불변 계보로 저장하고 실제 공급자 완료 봉 백테스트를 실행한다. 같은 분석·종목의 실험만 60초 섀도우 감시에 연결하며 현재 신호가 있을 때만 사용자 승인 대기 내부 후보를 만들고, 신호 없음·지원 밖 시장·위험 실패는 사유와 함께 보류한다.", "result", 2780, main_y, ["feat-execution-internal-paper-candidate"], code_paths=["src/App.tsx", "src/meetingBacktest.ts", "src-tauri/src/meeting_handoff.rs", "src-tauri/src/operations.rs"], test_paths=["scripts/meetingBacktest.test.ts", "src-tauri/src/meeting_handoff.rs", "src-tauri/src/operations.rs"], completion_criteria="실제 회의 분석 ID가 백테스트 실험과 섀도우 후보의 원인 사건 ID로 저장되고 사용자 승인 뒤 내부 원장에 한 번 체결된 통합 실행 증거가 있다."),
+        node("flow-meeting-analysis-cycle-approval", "사용자 승인", "사용자가 후보의 종목·방향·수량·가격·비용·위험 사유를 확인하고 승인 또는 거절한다.", "decision", 3010, main_y, ["feat-decision-portfolio-manager", "feat-remote-local-approval"], branch_condition="명시적 승인만 내부 모의체결로 진행"),
+        node("flow-meeting-analysis-cycle-execution", "내부 모의체결", "SHADOW ONLY 경계에서 시장 세션과 비용 규칙을 적용해 SQLite 내부 모의계좌에만 체결한다.", "action", 3240, main_y, ["feat-execution-manual-paper-orders", "feat-execution-internal-paper-candidate"], code_paths=["src-tauri/src/paper_trading.rs"]),
+        node("flow-meeting-analysis-cycle-ledger", "원장·예수금·성과 반영", "체결 사건을 append-only 원장에 한 번 기록하고 예수금·포지션·실현손익·분석 결과를 같은 사건 계보로 갱신한다.", "result", 3470, main_y, ["feat-execution-ledger", "feat-execution-ledger-ui"], code_paths=["src-tauri/src/persistence.rs", "src-tauri/src/paper_trading.rs"]),
+        node("flow-meeting-analysis-cycle-shadow", "섀도우 감시 또는 종료", "승인된 전략은 최신 완료 봉을 감시하고, 단건 분석은 저장된 결과와 원장 상태를 보여준 뒤 종료한다.", "result", 3700, main_y, ["feat-stages-shadow", "feat-stages-shadow-live-bars"], completion_criteria="분석 원인 사건부터 감시·후보·원장까지 재시작 후에도 중복 없이 재생된다."),
+        node("flow-meeting-analysis-cycle-symbol-error", "종목 불명확·보유 없음", "동명 법인·시장 불명확 또는 연결 계좌에 포지션이 없으면 후보를 만들지 않고 사용자가 종목·계좌를 다시 선택한다.", "result", 480, branch_y, ["feat-broker-symbol-autocomplete"], branch_condition="종목 또는 포지션을 확정하지 못함"),
+        node("flow-meeting-analysis-cycle-provider-error", "공급자 결측·stale", "필수 공급자가 미설정·오류·stale이면 결측 근거를 표시하고 보류하거나 사용자가 허용한 부분 분석만 수행한다.", "result", 710, branch_y, ["feat-official-news-community-adapters", "feat-analysis-point-in-time-price-snapshot"], branch_condition="필수 근거의 신선도 또는 연결 조건 미충족"),
+        node("flow-meeting-analysis-cycle-partial-failure", "부서 부분 실패·재시작", "완료 보고는 체크포인트로 보존하고 실패·미완료 부서만 재실행하거나 사용자가 회의를 취소한다.", "action", 1400, branch_y, ["feat-operations-meeting-checkpoint-recovery"], branch_condition="일부 직원·부서 작업 실패 또는 앱 재시작", code_paths=["src/workflowRecovery.ts", "src-tauri/src/persistence.rs"], test_paths=["scripts/workflowRecovery.test.ts"]),
+        node("flow-meeting-analysis-cycle-codex-recovery", "Codex 한도·취소 복구", "입력과 검증된 완료 보고를 보존한 채 취소·한도·응답 계약 오류를 설명하고 안전하게 재시도한다.", "action", 2090, branch_y, ["feat-codex-long-session-recovery-ux"], branch_condition="Codex 실행 취소·한도·계약 검증 실패"),
+        node("flow-meeting-analysis-cycle-risk-rejected", "위험 기각·보류", "위험 조건이 하나라도 실패하면 주문 후보를 만들지 않고 기각 사유를 분석 기록에 남긴다.", "result", 2550, branch_y, ["feat-risk-pretrade", "feat-analysis-generic-records"], branch_condition="결정론적 위험 게이트 실패"),
+        node("flow-meeting-analysis-cycle-duplicate", "중복 주문 차단·원장 대사", "같은 원인 사건의 후보·체결 재전송을 차단하고 불일치가 있으면 체결을 중단한 채 원장을 재생한다.", "result", 3240, branch_y, ["feat-execution-ledger", "feat-execution-internal-paper-candidate"], branch_condition="idempotency 충돌 또는 원장 대사 실패"),
+    ]
+
+
+def meeting_flow_edges() -> list[dict[str, str]]:
+    pairs = [
+        ("phase", "1"), ("1", "symbol"), ("symbol", "preflight"),
+        ("preflight", "evidence"), ("evidence", "2"), ("2", "3"),
+        ("3", "4"), ("4", "5"), ("5", "6"), ("6", "save"),
+        ("save", "risk"), ("risk", "7"), ("7", "approval"),
+        ("approval", "execution"), ("execution", "ledger"), ("ledger", "shadow"),
+        ("symbol", "symbol-error"), ("preflight", "provider-error"),
+        ("3", "partial-failure"), ("partial-failure", "3"),
+        ("6", "codex-recovery"), ("codex-recovery", "6"),
+        ("risk", "risk-rejected"), ("execution", "duplicate"),
+    ]
+    prefix = "flow-meeting-analysis-cycle-"
+    return [
+        {"id": f"edge-meeting-analysis-cycle-{index + 1}", "sourceNodeId": f"{prefix}{source}", "targetNodeId": f"{prefix}{target}"}
+        for index, (source, target) in enumerate(pairs)
+    ]
 
 
 def set_feature_checks(feature_item: dict[str, Any], met_indices: set[int]) -> None:
@@ -412,13 +525,15 @@ def normalize_prd(markdown: str, counts: dict[str, int]) -> str:
     lines.extend(
         [
             "",
-            f"## {AUDIT_SECTION_TITLE} (2026-08-25)",
+            f"## {AUDIT_SECTION_TITLE} (2026-08-31)",
             "- 완료는 코드 경로와 테스트 근거가 있고 모든 수용 기준이 충족된 기능만 사용한다. 일부만 구현된 기능은 진행 중, 계정·공급자·모델이 필요한 기능은 계획으로 유지한다.",
             "- 실제 구현된 44인 로스터와 역할별 Codex 정책·RoleReport 계약을 조직도 역할 노드에 반영했다. 외부 계좌 왕복·24시간 운영·전용 엔진이 필요한 직원 기능은 부분 체크로 남겼다.",
             "- 잘못 배치된 토스 계좌 잔고 UI를 브로커 대분류로 옮기고 기능 정렬 순서를 트리 기준으로 고유하게 다시 부여했다.",
             "- 중복된 PRD 장 번호를 현재 문서 순서대로 다시 매기고 기능 부모·유저플로 연결·edge 무결성을 재검사했다.",
             "- 누락됐던 보호 판정 운영 화면, 원장 기반 포트폴리오 위험 UI, 청산 사유, 운영 DB 복원, 선물 공식 생명주기, Codex 장시간 복구, NASDAQ 공급자, 섀도우 내구 검사와 티스토리 수동 게시 패키지 노드를 추가했다.",
             "- 중복이던 뉴스·커뮤니티 어댑터는 공급자 선정 하위의 정식 노드 하나로 합치고 데이터 수집 하위 레거시 노드는 제거했다.",
+            "- 소셜 로그인 전송 구현과 계정 생명주기 정책을 분리하고, WebSocket·Telegram·KIS 차트 어댑터의 구현 완료와 실제 장시간·자격정보 왕복을 서로 다른 기준으로 나눴다.",
+            "- 분석 요청부터 근거 수집·부서 회의·분석 보관·위험 판정·사용자 승인·내부 체결·원장·섀도우까지 한 유저플로우로 연결하고 실패·복구 분기를 추가했다. 실제 엔진 통합 실행이 없는 후보 이후 단계와 레인 전체는 미완료로 교정했다.",
             f"- 감사 후 기능 노드 상태: 완료 {counts['done']}개, 진행 중 {counts['in_progress']}개, 계획 {counts['planned']}개.",
         ]
     )
@@ -433,12 +548,12 @@ def normalize_prd(markdown: str, counts: dict[str, int]) -> str:
     return "\n".join(numbered).rstrip()
 
 
-def normalize_flow(current: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+def normalize_flow(
+    current: dict[str, Any], *, reconcile: bool
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     nodes: list[dict[str, Any]] = []
     for raw in current["userFlow"]["nodes"]:
         metadata = json.loads(raw.get("metadata_json") or "{}")
-        if raw["id"] in FLOW_COMPLETED_IDS:
-            metadata["isCompleted"] = True
         nodes.append(
             {
                 "id": raw["id"],
@@ -472,6 +587,28 @@ def normalize_flow(current: dict[str, Any]) -> tuple[list[dict[str, Any]], list[
         }
         for edge in current["userFlow"]["edges"]
     ]
+    if not reconcile:
+        return nodes, edges
+
+    by_id = {node["id"]: node for node in nodes}
+    for node_id, is_completed in FLOW_COMPLETION_OVERRIDES.items():
+        if node_id in by_id:
+            by_id[node_id]["isCompleted"] = is_completed
+
+    meeting_nodes = meeting_flow_nodes()
+    meeting_ids = {node["id"] for node in meeting_nodes}
+    nodes = [node for node in nodes if node["id"] not in meeting_ids]
+    nodes.extend(meeting_nodes)
+    edges = [
+        edge
+        for edge in edges
+        if edge["sourceNodeId"] not in meeting_ids
+        and edge["targetNodeId"] not in meeting_ids
+    ]
+    edges.extend(meeting_flow_edges())
+    # ProjectStudio 조회 순서와 맞춰 두 번째 실행이 리비전을 만들지 않게 한다.
+    nodes.sort(key=lambda node: (node["laneId"], node["positionX"], node["id"]))
+    edges.sort(key=lambda edge: edge["id"])
     return nodes, edges
 
 
@@ -562,6 +699,131 @@ def main() -> None:
                 }
             )
 
+        # OAuth 전송 구현은 보안 기능 노드 하나에서만 추적한다. 이전 작업공간
+        # 노드는 아직 남은 계정 생명주기 정책으로 좁혀 중복 개발을 막는다.
+        social_lifecycle = by_id["feat-workspace-social-auth-expansion"]
+        social_lifecycle["title"] = "연결 계정 생명주기·복구 정책"
+        social_lifecycle["description"] = (
+            "Google OAuth 구현과 별개로 연결 계정 해제, 소유자 복구, 세션 만료, 탈퇴와 로컬 데이터 "
+            "보존·삭제 정책을 확정한다. 인증 전송 구현은 feat-security-social-login에서만 추적한다."
+        )
+        social_lifecycle["acceptanceCriteria"] = [
+            {
+                "id": "ac-social-auth-lifecycle-1",
+                "description": "연결 계정 해제·세션 만료·소유자 복구 시나리오와 재인증 조건을 확정한다.",
+                "isMet": True,
+                "sortOrder": 0,
+            },
+            {
+                "id": "ac-social-auth-lifecycle-2",
+                "description": "탈퇴 시 로컬 데이터·보안 저장소 식별자·백업의 보존과 삭제 범위를 확정하고 검증한다.",
+                "isMet": True,
+                "sortOrder": 1,
+            },
+        ]
+        social_lifecycle["status"] = "done"
+
+        # 구현과 실제 공급자 장시간 왕복을 하나의 미체크 기준으로 섞지 않는다.
+        realtime = by_id["feat-official-realtime-stream-adapters"]
+        realtime["acceptanceCriteria"][5]["isMet"] = True
+
+        aggregation = by_id["feat-auto-realtime-aggregation"]
+        aggregation["acceptanceCriteria"][6].update(
+            {
+                "description": "토스 공식 101 handshake와 국장 시장 topic 구독 ack를 실제 연결에서 확인한다.",
+                "isMet": True,
+            }
+        )
+        if not any(
+            item["id"] == "feat-auto-realtime-aggregation-ac-8"
+            for item in aggregation["acceptanceCriteria"]
+        ):
+            aggregation["acceptanceCriteria"].append(
+                {
+                    "id": "feat-auto-realtime-aggregation-ac-8",
+                    "description": "국장·미장 장중 체결·호가와 자산별 24시간 공식 공급자 왕복을 검증한다.",
+                    "isMet": False,
+                    "sortOrder": len(aggregation["acceptanceCriteria"]),
+                }
+            )
+
+        news = by_id["feat-official-news-community-adapters"]
+        news["acceptanceCriteria"][3]["isMet"] = True
+        news["acceptanceCriteria"][2].update(
+            {
+                "description": "사용자 MTProto 자격정보로 선택 Telegram 방송 채널의 실제 읽기 전용 수집을 검증한다.",
+                "isMet": True,
+            }
+        )
+        if not any(
+            item["id"] == "feat-official-news-community-adapters-ac-6"
+            for item in news["acceptanceCriteria"]
+        ):
+            news["acceptanceCriteria"].append(
+                {
+                    "id": "feat-official-news-community-adapters-ac-6",
+                    "description": "사용자 SEC 연락처로 대표 미국 종목의 재무·공시 실제 왕복을 반복 검증한다.",
+                    "isMet": False,
+                    "sortOrder": len(news["acceptanceCriteria"]),
+                }
+            )
+
+        ai_providers = by_id["feat-ai-provider-analysis-adapters"]
+        ai_providers["acceptanceCriteria"][5].update(
+            {
+                "description": "Claude·Antigravity 응답을 44인 공통 RoleReport·DepartmentReport 서버 계약으로 검증한다.",
+                "isMet": True,
+            }
+        )
+        if not any(
+            item["id"] == "feat-ai-provider-analysis-adapters-ac-7"
+            for item in ai_providers["acceptanceCriteria"]
+        ):
+            ai_providers["acceptanceCriteria"].append(
+                {
+                    "id": "feat-ai-provider-analysis-adapters-ac-7",
+                    "description": "외부 AI의 직원별 작업 상태 이벤트·취소·부서 집계 실행을 공통 오케스트레이션에 연결한다.",
+                    "isMet": True,
+                    "sortOrder": len(ai_providers["acceptanceCriteria"]),
+                }
+            )
+        else:
+            next(
+                item
+                for item in ai_providers["acceptanceCriteria"]
+                if item["id"] == "feat-ai-provider-analysis-adapters-ac-7"
+            ).update(
+                {
+                    "description": "외부 AI의 직원별 작업 상태 이벤트·취소·부서 집계 실행을 공통 오케스트레이션에 연결한다.",
+                    "isMet": True,
+                }
+            )
+
+        cross_asset = by_id["feat-cross-asset-chart-annotation-contracts"]
+        cross_asset["acceptanceCriteria"][4].update(
+            {
+                "description": "KIS 공식 국내선물 계약별 일봉 어댑터가 계약코드·세션·PIT 시각을 보존한다.",
+                "isMet": True,
+            }
+        )
+        if not any(
+            item["id"] == "ac-cross-chart-securities-provider-roundtrip"
+            for item in cross_asset["acceptanceCriteria"]
+        ):
+            cross_asset["acceptanceCriteria"].append(
+                {
+                    "id": "ac-cross-chart-securities-provider-roundtrip",
+                    "description": "KIS 자격정보가 있는 환경에서 국내선물 공식 응답과 차트 근거의 실제 왕복을 검증한다.",
+                    "isMet": False,
+                    "sortOrder": len(cross_asset["acceptanceCriteria"]),
+                }
+            )
+
+        # 실제 Google 계정 거부→연결→재로그인 왕복과 토스 읽기 전용 어댑터는
+        # 저장소 문서·회귀 테스트에 근거가 있으므로 중복 미완료로 남기지 않는다.
+        by_id["feat-security-social-login"]["acceptanceCriteria"][4]["isMet"] = True
+        by_id["feat-records-external-integration-priority"]["acceptanceCriteria"][5]["isMet"] = True
+
         workspace_settings = by_id["feat-workspace-settings"]
         workspace_settings["acceptanceCriteria"][1]["description"] = (
             "토스 공식 KR·US 캘린더의 휴장·부분 세션·미국 익일 종료를 조회하고 운영 화면에 표시한다."
@@ -619,10 +881,10 @@ def main() -> None:
         normalize_feature_order(features)
         counts = {status: sum(item["status"] == status for item in features) for status in ("done", "in_progress", "planned")}
         markdown = normalize_prd(current["project"]["prd_markdown"], counts)
-        nodes, edges = normalize_flow(current)
+        nodes, edges = normalize_flow(current, reconcile=True)
         validate_state(features, nodes, edges)
 
-        current_nodes, current_edges = normalize_flow(current)
+        current_nodes, current_edges = normalize_flow(current, reconcile=False)
         if (
             current["features"] == features
             and current["project"]["prd_markdown"] == markdown

@@ -70,7 +70,8 @@ def features() -> list[dict[str, Any]]:
                 ("Antigravity는 검색·URL 읽기만 허용하고 코드 실행·파일·custom function·MCP를 제공하지 않는다.", True),
                 ("분석 응답은 공급자·모델·관측시각·토큰 사용량·분석 전용 상태로 정규화한다.", True),
                 ("사용자 API 키로 Claude·Antigravity 실제 왕복을 검증한다.", False),
-                ("44인 직원의 RoleReport·DepartmentReport·취소·스트리밍 계약을 공급자 공통 계층에 연결한다.", False),
+                ("Claude·Antigravity 응답을 44인 공통 RoleReport·DepartmentReport 서버 계약으로 검증한다.", True),
+                ("외부 AI의 직원별 작업 상태 이벤트·취소·부서 집계 실행을 공통 오케스트레이션에 연결한다.", True),
             ]),
         },
         {
@@ -126,7 +127,7 @@ def features() -> list[dict[str, Any]]:
                 ("SEC Company Facts·Submissions 읽기 전용 어댑터를 구현한다.", True),
                 ("Telegram 선택 방송 채널 읽기 전용 수집과 리비전 보존을 구현한다.", True),
                 ("사용자 연락처·MTProto 자격정보로 SEC·Telegram 실제 왕복을 검증한다.", False),
-                ("OpenDART와 네이버 뉴스 검색 공식 API 어댑터를 구현한다.", False),
+                ("OpenDART와 네이버 뉴스 검색 공식 API 어댑터를 구현한다.", True),
                 ("Reddit·Stocktwits는 개발자 승인·약관·보존정책 확정 후에만 구현한다.", False),
             ]),
         },

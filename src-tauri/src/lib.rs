@@ -23,8 +23,10 @@ pub mod local_security;
 pub mod manual_orders;
 pub mod market_aggregation;
 pub mod market_data;
+pub mod meeting_handoff;
 pub mod ml_pipeline;
 pub mod ml_worker_runner;
+pub mod official_kr_data;
 pub mod operational_controls;
 pub mod operational_readiness;
 pub mod operations;
@@ -63,6 +65,7 @@ pub fn run() {
         .manage(binance::BinanceBridge::default())
         .manage(crypto_market::CryptoMarketBridge::default())
         .manage(market_data::MarketDataBridge::default())
+        .manage(official_kr_data::OfficialKrDataBridge::new())
         .manage(reference::ReferenceFetcher::default())
         .manage(sec_fundamentals::SecFundamentalsBridge::default())
         .manage(telegram::TelegramBridge::default())
@@ -77,6 +80,22 @@ pub fn run() {
 
             let app_data_dir = app.path().app_data_dir()?;
             local_security::harden_app_data(&app_data_dir).map_err(std::io::Error::other)?;
+            let headless_shadow_soak = if operational_readiness::headless_shadow_soak_requested() {
+                if let Some(window) = app.get_webview_window("main") {
+                    window.hide()?;
+                }
+                match operational_readiness::acquire_headless_shadow_soak(&app_data_dir)
+                    .map_err(std::io::Error::other)?
+                {
+                    Some(guard) => Some(guard),
+                    None => {
+                        app.handle().exit(0);
+                        return Ok(());
+                    }
+                }
+            } else {
+                None
+            };
             let database_path = app_data_dir.join("investa.sqlite3");
             let persistence = persistence::PersistenceBridge::open(&database_path)
                 .map_err(std::io::Error::other)?;
@@ -89,6 +108,14 @@ pub fn run() {
             cloud_relay::start_polling(app.handle().clone());
             operations::start_shadow_engine(app.handle().clone());
             pit_providers::start_collection_scheduler(app.handle().clone());
+            if let Some(guard) = headless_shadow_soak {
+                operational_readiness::start_headless_shadow_soak(
+                    app.handle().clone(),
+                    app_data_dir,
+                    guard,
+                )
+                .map_err(std::io::Error::other)?;
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -96,6 +123,13 @@ pub fn run() {
             ai_providers::ai_provider_save_config,
             ai_providers::ai_provider_delete_config,
             ai_providers::ai_provider_run_analysis,
+            ai_providers::ai_provider_run_role_report,
+            ai_providers::ai_provider_run_department_report,
+            ai_providers::ai_provider_cancel_job,
+            official_kr_data::official_kr_data_status,
+            official_kr_data::official_kr_data_save_config,
+            official_kr_data::opendart_disclosures,
+            official_kr_data::naver_news_search,
             codex::codex_status,
             codex::codex_start_turn,
             codex::codex_cancel_turn,
@@ -169,6 +203,9 @@ pub fn run() {
             social_auth::google_login,
             social_auth::google_link_account,
             workspace_identity::workspace_identity_status,
+            workspace_identity::workspace_identity_lifecycle_policy,
+            workspace_identity::workspace_identity_unlink_provider,
+            workspace_identity::workspace_identity_logout,
             market_data::market_indices_snapshot,
             market_data::toss_market_calendars,
             market_data::toss_chart_snapshot,
@@ -212,6 +249,10 @@ pub fn run() {
             operations::meeting_workflow_interrupted,
             operations::meeting_workflow_resume,
             operations::meeting_workflow_dismiss,
+            meeting_handoff::meeting_paper_handoff_prepare,
+            meeting_handoff::meeting_paper_handoff_finalize,
+            meeting_handoff::meeting_paper_handoff_history,
+            meeting_handoff::meeting_paper_golden_path_audit,
             operational_readiness::workspace_preferences_get,
             operational_readiness::workspace_preferences_save,
             operational_readiness::market_order_normalize,
@@ -222,6 +263,7 @@ pub fn run() {
             operational_readiness::shadow_soak_audit_save,
             operational_readiness::shadow_soak_sample,
             operational_readiness::operations_dashboard_snapshot,
+            operational_readiness::cloud_soak_report_snapshot,
             operational_controls::paper_risk_monitor_evaluate,
             operational_controls::trade_quality_analyze,
             operational_controls::crypto_risk_policy_change_save,

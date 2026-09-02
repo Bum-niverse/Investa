@@ -2,7 +2,15 @@ use keyring::{Entry, Error as KeyringError};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    time::Duration,
+};
+use tauri::{AppHandle, Emitter};
 
 const KEYRING_SERVICE: &str = "Investa.AiProviders";
 const REQUEST_TIMEOUT_SECONDS: u64 = 300;
@@ -88,6 +96,28 @@ pub struct AiAnalysisResponse {
     analysis_only: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiRoleReportRequest {
+    provider: AiProviderId,
+    job_id: String,
+    agent_id: String,
+    prompt: String,
+    max_tokens: Option<u32>,
+    user_confirmed_paid_call: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiDepartmentReportRequest {
+    provider: AiProviderId,
+    job_id: String,
+    department_id: String,
+    prompt: String,
+    max_tokens: Option<u32>,
+    user_confirmed_paid_call: bool,
+}
+
 #[derive(Clone)]
 struct StoredConfig {
     api_key: String,
@@ -96,6 +126,7 @@ struct StoredConfig {
 
 pub struct AiProviderBridge {
     client: Client,
+    active_jobs: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
 impl Default for AiProviderBridge {
@@ -105,8 +136,93 @@ impl Default for AiProviderBridge {
                 .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECONDS))
                 .build()
                 .expect("AI provider HTTP client"),
+            active_jobs: Mutex::new(HashMap::new()),
         }
     }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiProviderJobCancelled {
+    job_id: String,
+    cancelled: bool,
+    message: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AiProviderUiEvent {
+    job_id: String,
+    provider: AiProviderId,
+    subject_id: String,
+    kind: &'static str,
+    message: Option<String>,
+}
+
+fn valid_job_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':' | b'.'))
+}
+
+impl AiProviderBridge {
+    fn begin_job(&self, job_id: &str) -> Result<Arc<AtomicBool>, String> {
+        if !valid_job_id(job_id) {
+            return Err("외부 AI 작업 ID 형식이 올바르지 않습니다.".to_owned());
+        }
+        let mut jobs = self
+            .active_jobs
+            .lock()
+            .map_err(|_| "외부 AI 작업 잠금을 열지 못했습니다.".to_owned())?;
+        if jobs.contains_key(job_id) {
+            return Err("같은 외부 AI 작업 ID가 이미 실행 중입니다.".to_owned());
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        jobs.insert(job_id.to_owned(), cancelled.clone());
+        Ok(cancelled)
+    }
+
+    fn finish_job(&self, job_id: &str) {
+        if let Ok(mut jobs) = self.active_jobs.lock() {
+            jobs.remove(job_id);
+        }
+    }
+
+    fn cancel_job(&self, job_id: &str) -> Result<bool, String> {
+        if !valid_job_id(job_id) {
+            return Err("외부 AI 작업 ID 형식이 올바르지 않습니다.".to_owned());
+        }
+        let jobs = self
+            .active_jobs
+            .lock()
+            .map_err(|_| "외부 AI 작업 잠금을 열지 못했습니다.".to_owned())?;
+        Ok(jobs.get(job_id).is_some_and(|flag| {
+            flag.store(true, Ordering::Release);
+            true
+        }))
+    }
+}
+
+fn emit_job_event(
+    app: &AppHandle,
+    job_id: &str,
+    provider: AiProviderId,
+    subject_id: &str,
+    kind: &'static str,
+    message: Option<String>,
+) {
+    let _ = app.emit(
+        "ai-provider://event",
+        AiProviderUiEvent {
+            job_id: job_id.to_owned(),
+            provider,
+            subject_id: subject_id.to_owned(),
+            kind,
+            message,
+        },
+    );
 }
 
 fn entry(provider: AiProviderId, field: &str) -> Result<Entry, String> {
@@ -349,52 +465,58 @@ pub fn ai_provider_delete_config(provider: AiProviderId) -> Result<AiProviderSta
     status(provider)
 }
 
-#[tauri::command]
-pub async fn ai_provider_run_analysis(
-    bridge: tauri::State<'_, AiProviderBridge>,
+async fn run_analysis(
+    bridge: &AiProviderBridge,
     request: AiAnalysisRequest,
+    cancellation: Option<Arc<AtomicBool>>,
 ) -> Result<AiAnalysisResponse, String> {
     let (provider, prompt, max_tokens) = validate_analysis_request(request)?;
     let config = load_config(provider)?
         .ok_or_else(|| format!("{} API 키를 먼저 설정해 주세요.", provider.label()))?;
 
-    let response = match provider {
-        AiProviderId::Claude => {
-            bridge
-                .client
-                .post(CLAUDE_ENDPOINT)
-                .header("x-api-key", &config.api_key)
-                .header("anthropic-version", "2023-06-01")
-                .json(&json!({
-                    "model": config.model,
-                    "max_tokens": max_tokens.min(8_192),
-                    "system": ANALYSIS_BOUNDARY,
-                    "messages": [{"role": "user", "content": prompt}]
-                }))
-                .send()
-                .await
+    let response_future = match provider {
+        AiProviderId::Claude => bridge
+            .client
+            .post(CLAUDE_ENDPOINT)
+            .header("x-api-key", &config.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&json!({
+                "model": config.model,
+                "max_tokens": max_tokens.min(8_192),
+                "system": ANALYSIS_BOUNDARY,
+                "messages": [{"role": "user", "content": prompt}]
+            }))
+            .send(),
+        AiProviderId::Antigravity => bridge
+            .client
+            .post(ANTIGRAVITY_ENDPOINT)
+            .header("x-goog-api-key", &config.api_key)
+            .json(&json!({
+                "agent": ANTIGRAVITY_AGENT,
+                "input": format!("{ANALYSIS_BOUNDARY}\n\nUser analysis request:\n{prompt}"),
+                "tools": [
+                    {"type": "google_search"},
+                    {"type": "url_context"}
+                ],
+                "store": false,
+                "agent_config": {
+                    "type": "antigravity",
+                    "max_total_tokens": max_tokens
+                }
+            }))
+            .send(),
+    };
+    let response = if let Some(cancelled) = cancellation {
+        tokio::select! {
+            response = response_future => response,
+            _ = async {
+                while !cancelled.load(Ordering::Acquire) {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            } => return Err("사용자가 외부 AI 작업을 취소했습니다.".to_owned()),
         }
-        AiProviderId::Antigravity => {
-            bridge
-                .client
-                .post(ANTIGRAVITY_ENDPOINT)
-                .header("x-goog-api-key", &config.api_key)
-                .json(&json!({
-                    "agent": ANTIGRAVITY_AGENT,
-                    "input": format!("{ANALYSIS_BOUNDARY}\n\nUser analysis request:\n{prompt}"),
-                    "tools": [
-                        {"type": "google_search"},
-                        {"type": "url_context"}
-                    ],
-                    "store": false,
-                    "agent_config": {
-                        "type": "antigravity",
-                        "max_total_tokens": max_tokens
-                    }
-                }))
-                .send()
-                .await
-        }
+    } else {
+        response_future.await
     }
     .map_err(|_| format!("{} API에 연결하지 못했습니다.", provider.label()))?;
 
@@ -449,6 +571,179 @@ pub async fn ai_provider_run_analysis(
     }
 }
 
+#[tauri::command]
+pub async fn ai_provider_run_analysis(
+    bridge: tauri::State<'_, AiProviderBridge>,
+    request: AiAnalysisRequest,
+) -> Result<AiAnalysisResponse, String> {
+    run_analysis(&bridge, request, None).await
+}
+
+#[tauri::command]
+pub async fn ai_provider_run_role_report(
+    bridge: tauri::State<'_, AiProviderBridge>,
+    app: AppHandle,
+    request: AiRoleReportRequest,
+) -> Result<crate::codex::RoleReport, String> {
+    if request.prompt.trim().is_empty() {
+        return Err("직원 분석 요청은 비어 있을 수 없습니다.".to_owned());
+    }
+    let cancellation = bridge.begin_job(&request.job_id)?;
+    emit_job_event(
+        &app,
+        &request.job_id,
+        request.provider,
+        &request.agent_id,
+        "started",
+        None,
+    );
+    let schema = match crate::codex::external_role_report_contract(&request.agent_id) {
+        Ok(schema) => schema,
+        Err(error) => {
+            bridge.finish_job(&request.job_id);
+            return Err(error);
+        }
+    };
+    let prompt = format!(
+        "{}\n\nReturn only one JSON object that satisfies this exact schema:\n{}",
+        request.prompt.trim(),
+        schema
+    );
+    emit_job_event(
+        &app,
+        &request.job_id,
+        request.provider,
+        &request.agent_id,
+        "generating",
+        None,
+    );
+    let result = run_analysis(
+        &bridge,
+        AiAnalysisRequest {
+            provider: request.provider,
+            prompt,
+            max_tokens: request.max_tokens,
+            user_confirmed_paid_call: request.user_confirmed_paid_call,
+        },
+        Some(cancellation),
+    )
+    .await
+    .and_then(|response| {
+        emit_job_event(
+            &app,
+            &request.job_id,
+            request.provider,
+            &request.agent_id,
+            "validating",
+            None,
+        );
+        crate::codex::parse_role_report(&response.text, &request.agent_id)
+    });
+    bridge.finish_job(&request.job_id);
+    emit_job_event(
+        &app,
+        &request.job_id,
+        request.provider,
+        &request.agent_id,
+        if result.is_ok() { "completed" } else { "error" },
+        result.as_ref().err().cloned(),
+    );
+    result
+}
+
+#[tauri::command]
+pub async fn ai_provider_run_department_report(
+    bridge: tauri::State<'_, AiProviderBridge>,
+    app: AppHandle,
+    request: AiDepartmentReportRequest,
+) -> Result<crate::codex::DepartmentReport, String> {
+    if request.prompt.trim().is_empty() {
+        return Err("부서 분석 요청은 비어 있을 수 없습니다.".to_owned());
+    }
+    let cancellation = bridge.begin_job(&request.job_id)?;
+    emit_job_event(
+        &app,
+        &request.job_id,
+        request.provider,
+        &request.department_id,
+        "started",
+        None,
+    );
+    let schema = match crate::codex::external_department_report_contract(&request.department_id) {
+        Ok(schema) => schema,
+        Err(error) => {
+            bridge.finish_job(&request.job_id);
+            return Err(error);
+        }
+    };
+    let prompt = format!(
+        "{}\n\nReturn only one JSON object that satisfies this exact schema:\n{}",
+        request.prompt.trim(),
+        schema
+    );
+    emit_job_event(
+        &app,
+        &request.job_id,
+        request.provider,
+        &request.department_id,
+        "generating",
+        None,
+    );
+    let result = run_analysis(
+        &bridge,
+        AiAnalysisRequest {
+            provider: request.provider,
+            prompt,
+            max_tokens: request.max_tokens,
+            user_confirmed_paid_call: request.user_confirmed_paid_call,
+        },
+        Some(cancellation),
+    )
+    .await
+    .and_then(|response| {
+        emit_job_event(
+            &app,
+            &request.job_id,
+            request.provider,
+            &request.department_id,
+            "validating",
+            None,
+        );
+        let report = crate::codex::parse_department_report(&response.text)?;
+        if report.department_id != request.department_id {
+            return Err("외부 AI 부서 보고의 부서 ID가 배정 계약과 일치하지 않습니다.".to_owned());
+        }
+        Ok(report)
+    });
+    bridge.finish_job(&request.job_id);
+    emit_job_event(
+        &app,
+        &request.job_id,
+        request.provider,
+        &request.department_id,
+        if result.is_ok() { "completed" } else { "error" },
+        result.as_ref().err().cloned(),
+    );
+    result
+}
+
+#[tauri::command]
+pub fn ai_provider_cancel_job(
+    bridge: tauri::State<'_, AiProviderBridge>,
+    job_id: String,
+) -> Result<AiProviderJobCancelled, String> {
+    let cancelled = bridge.cancel_job(&job_id)?;
+    Ok(AiProviderJobCancelled {
+        job_id,
+        cancelled,
+        message: if cancelled {
+            "외부 AI 네트워크 요청 취소를 전달했습니다.".to_owned()
+        } else {
+            "실행 중인 외부 AI 작업을 찾지 못했습니다.".to_owned()
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,6 +775,17 @@ mod tests {
             user_confirmed_paid_call: true,
         })
         .is_err());
+    }
+
+    #[test]
+    fn job_registry_rejects_duplicates_and_cancels_without_exposing_credentials() {
+        let bridge = AiProviderBridge::default();
+        let flag = bridge.begin_job("external:role:1").expect("job");
+        assert!(bridge.begin_job("external:role:1").is_err());
+        assert!(bridge.cancel_job("external:role:1").expect("cancel"));
+        assert!(flag.load(Ordering::Acquire));
+        bridge.finish_job("external:role:1");
+        assert!(!bridge.cancel_job("external:role:1").expect("missing"));
     }
 
     #[test]

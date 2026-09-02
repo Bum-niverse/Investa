@@ -1,0 +1,11 @@
+{
+  "name": "investa-cloud-soak",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "test:market": "node runner.mjs --mode market --duration-seconds 10 --heartbeat-seconds 5",
+    "test:shadow": "node runner.mjs --mode shadow-contract --duration-seconds 10 --heartbeat-seconds 5"
+  }
+}

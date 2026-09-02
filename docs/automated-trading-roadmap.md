@@ -117,6 +117,8 @@ LightGBM·XGBoost·Chronos·TimesFM worker 요청은 코드 버전·seed·horizo
 - SEC·Telegram·OpenDART·네이버 뉴스와 선택 커뮤니티
 - Claude·Antigravity 실제 분석 왕복
 - 24시간 스트림·섀도우·재시작·네트워크 단절 soak test
+
+2026-09-02 OpenDART 공시목록과 네이버 뉴스 검색의 읽기 전용 Rust 어댑터를 추가했다. 자격정보는 Windows 자격 증명 관리자에만 저장하며 bounded query, 10초 timeout, 안전한 오류와 허용 DTO를 적용한다. Claude·Antigravity 단일 응답은 Codex와 같은 `RoleReport`·`DepartmentReport` 서버 검증을 통과해야 한다. 실제 API 키 왕복과 외부 AI의 직원별 스트리밍·취소·부서 집계 실행은 계속 미완료다.
 - Cloud relay는 `run.app` 라우팅 문제 해결 뒤 마지막에 재개
 
 2026-08-31 내부 섀도우 실제 시간 수집 경로를 운영 패널에 연결했다. 프로세스 working set은 Windows 공식 `GetProcessMemoryInfo`로 읽고, SQLite 파일 크기·활성 섀도우 작업자·내부 후보·로컬 원장 건강·재시작 대사를 Rust에서 수집한다. 세션은 1분 표본으로 재개할 수 있지만 3분 초과 공백과 대사 실패는 통과시키지 않는다. 이는 검사 기반 구현 완료이며 실제 24시간 통과를 의미하지 않는다.

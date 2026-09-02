@@ -18,6 +18,7 @@ pub enum EvidenceKind {
     Repository,
     Paper,
     Documentation,
+    LocalAnalysis,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -407,13 +408,26 @@ pub fn review_research_report(report: &ResearchReport) -> StrategyReview {
                 "같은 근거 ID가 두 번 포함되었습니다.",
             );
         }
-        if !evidence.source_url.starts_with("https://") || !valid_text(&evidence.source_url, 2_048)
-        {
+        let valid_source_url = match evidence.kind {
+            EvidenceKind::LocalAnalysis => evidence
+                .source_url
+                .strip_prefix("investa://analysis/")
+                .is_some_and(|record_id| {
+                    !record_id.is_empty()
+                        && record_id.len() <= 256
+                        && record_id.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric()
+                                || matches!(byte, b'-' | b'_' | b'.' | b':' | b'%')
+                        })
+                }),
+            _ => evidence.source_url.starts_with("https://"),
+        };
+        if !valid_source_url || !valid_text(&evidence.source_url, 2_048) {
             issue(
                 &mut review.issues,
                 ResearchIssueCode::InvalidSourceUrl,
                 &format!("{field}.sourceUrl"),
-                "근거 URL은 길이가 제한된 HTTPS 주소여야 합니다.",
+                "외부 근거는 HTTPS, 로컬 회의 근거는 investa://analysis/<record-id> 주소여야 합니다.",
             );
         }
         if evidence.kind == EvidenceKind::Repository
@@ -580,6 +594,29 @@ mod tests {
             .issues
             .iter()
             .any(|item| item.code == ResearchIssueCode::MissingEvidence));
+    }
+
+    #[test]
+    fn accepts_bounded_local_analysis_lineage_and_rejects_other_local_schemes() {
+        let mut report = valid_report();
+        report.evidence[0] = ReferenceEvidence {
+            evidence_id: "repo-1".to_owned(),
+            kind: EvidenceKind::LocalAnalysis,
+            source_url: "investa://analysis/analysis-meeting-100".to_owned(),
+            revision: None,
+            license: None,
+            summary: "완료된 로컬 회의 분석 기록".to_owned(),
+            claimed_result: None,
+        };
+        assert!(review_research_report(&report).executable);
+
+        report.evidence[0].source_url = "file:///C:/secret.sqlite3".to_owned();
+        let review = review_research_report(&report);
+        assert!(!review.executable);
+        assert!(review
+            .issues
+            .iter()
+            .any(|item| item.code == ResearchIssueCode::InvalidSourceUrl));
     }
 
     #[test]

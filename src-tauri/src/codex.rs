@@ -811,7 +811,10 @@ fn parse_research_report(value: &str) -> Result<ResearchReport, String> {
         .map_err(|_| "Codex 연구 결과가 ResearchReport 계약과 일치하지 않습니다.".to_owned())
 }
 
-fn parse_role_report(value: &str, expected_agent_id: &str) -> Result<RoleReport, String> {
+pub(crate) fn parse_role_report(
+    value: &str,
+    expected_agent_id: &str,
+) -> Result<RoleReport, String> {
     let report: RoleReport = serde_json::from_str(value.trim())
         .map_err(|_| "Codex 개별 소견이 RoleReport 계약과 일치하지 않습니다.".to_owned())?;
     let policy = role_policy(expected_agent_id)
@@ -908,7 +911,7 @@ fn validate_text(value: &str, label: &str, max_chars: usize) -> Result<(), Strin
     Ok(())
 }
 
-fn parse_department_report(value: &str) -> Result<DepartmentReport, String> {
+pub(crate) fn parse_department_report(value: &str) -> Result<DepartmentReport, String> {
     let report: DepartmentReport = serde_json::from_str(value.trim())
         .map_err(|_| "Codex 부서 보고가 DepartmentReport 계약과 일치하지 않습니다.".to_owned())?;
     validate_text(&report.department_id, "부서 ID", 64)?;
@@ -1178,6 +1181,22 @@ fn department_report_schema() -> Value {
             "nextActions": { "type": "array", "maxItems": 12, "items": { "type": "string" } }
         }
     })
+}
+
+pub(crate) fn external_role_report_contract(agent_id: &str) -> Result<Value, String> {
+    let policy = role_policy(agent_id)
+        .ok_or_else(|| "이 직원은 구조화 개별 소견 대상이 아닙니다.".to_owned())?;
+    Ok(role_report_schema(agent_id, policy))
+}
+
+pub(crate) fn external_department_report_contract(department_id: &str) -> Result<Value, String> {
+    validate_text(department_id, "부서 ID", 64)?;
+    let mut schema = department_report_schema();
+    schema["properties"]["departmentId"] = json!({
+        "type": "string",
+        "const": department_id,
+    });
+    Ok(schema)
 }
 
 fn meeting_synthesis_schema() -> Value {

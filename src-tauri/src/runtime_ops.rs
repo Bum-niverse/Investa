@@ -986,6 +986,12 @@ fn reconcile(
     })
 }
 
+pub fn reconcile_for_shadow_soak(
+    bridge: &PersistenceBridge,
+) -> Result<ReconciliationReport, String> {
+    reconcile(bridge, now_ms()?)
+}
+
 #[tauri::command]
 pub fn operational_alerts(
     bridge: State<'_, PersistenceBridge>,
@@ -1283,6 +1289,12 @@ fn refresh_local_health(
         }
     }
     provider_health_report_at(bridge, observed_at_ms, PROVIDER_HEALTH_MAXIMUM_AGE_MS)
+}
+
+pub fn refresh_local_health_for_shadow_soak(
+    bridge: &PersistenceBridge,
+) -> Result<HealthReport, String> {
+    refresh_local_health(bridge, now_ms()?)
 }
 
 #[tauri::command]

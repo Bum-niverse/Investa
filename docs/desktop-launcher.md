@@ -16,6 +16,8 @@
 4. 같은 release 창이 이미 열려 있으면 새 프로세스를 만들지 않고 기존 창을 활성화한다.
 5. 빌드 실패는 숨기지 않고 `%LOCALAPPDATA%\Investa\launcher\launcher.log`와 오류 대화상자에 남긴다.
 
+저장소에서는 `pnpm desktop:start`로 같은 런처를 실행하고 `pnpm desktop:check`로 빌드 필요 여부만 확인한다. release는 Tauri의 `frontendDist`를 내장하므로 localhost에 접속하지 않는다. `devUrl=http://localhost:1430`은 `pnpm tauri dev`에서만 사용한다.
+
 `-CheckOnly`는 빌드나 실행 없이 판정 JSON만 출력한다.
 
 ## 보안 경계
