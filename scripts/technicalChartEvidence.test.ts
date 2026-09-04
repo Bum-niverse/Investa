@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildTechnicalChartAnnotations, buildTechnicalChartEvidence, validatePointInTimeChartBars, type TechnicalChartBar } from "../src/technicalChartEvidence.ts";
+import { buildTechnicalChartAnnotations, buildTechnicalChartEvidence, buildTechnicalChartEvidenceCollection, validatePointInTimeChartBars, type TechnicalChartBar } from "../src/technicalChartEvidence.ts";
 
 const bars = Array.from({ length: 80 }, (_, index): TechnicalChartBar => ({
   periodStartMs: 1_700_000_000_000 + index * 86_400_000,
@@ -105,4 +105,13 @@ test("자산별 차트 근거는 분석 보관함 JSON 왕복 뒤에도 좌표�
   assert.deepEqual(replay.annotations, evidence.annotations);
   assert.equal(replay.sourceSnapshotId, "vault-1");
   assert.equal(replay.schemaVersion, "2.0");
+});
+
+test("포트폴리오 차트 묶음은 종목별 선을 보존하고 동일 스냅샷을 중복 저장하지 않는다", () => {
+  const snapshot = { snapshotId: "portfolio-1", provider: "toss", symbol: "000880", name: "한화", market: "korea", currency: "KRW", interval: "1d", adjusted: true, asOfMs: bars[79].periodEndMs, bars, indicators: { rsi14: 61.2, macdLine: 12, macdSignal: 10, bollingerMiddle: 10_500, twentyDayReturnVolatilityPercent: 1.8 } };
+  const evidence = buildTechnicalChartEvidenceCollection([snapshot, snapshot]);
+  assert.equal(evidence.length, 1);
+  assert.equal(evidence[0].symbol, "000880");
+  assert.equal(evidence[0].indicators?.macdLine, 12);
+  assert.deepEqual(evidence[0].annotations.map((item) => item.kind), ["horizontal_line", "horizontal_line", "trend_line", "rectangle"]);
 });

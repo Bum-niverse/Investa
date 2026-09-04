@@ -64,6 +64,25 @@ function Get-LatestBuildInputUtc {
 }
 
 function Find-PnpmCommand {
+    $nodeCommand = Get-Command node.exe -ErrorAction SilentlyContinue
+    if ($null -eq $nodeCommand) {
+        $nodeCandidates = @(
+            (Join-Path $env:USERPROFILE ".cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe"),
+            (Join-Path $env:ProgramFiles "nodejs\node.exe"),
+            (Join-Path $env:LOCALAPPDATA "Programs\nodejs\node.exe")
+        )
+        if (-not [string]::IsNullOrWhiteSpace(${env:ProgramFiles(x86)})) {
+            $nodeCandidates += Join-Path ${env:ProgramFiles(x86)} "nodejs\node.exe"
+        }
+
+        $nodeExe = $nodeCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+        if ($null -eq $nodeExe) {
+            throw "node.exe was not found. Install Node.js or restore the bundled workspace runtime, then retry."
+        }
+        $nodeDirectory = Split-Path -Parent $nodeExe
+        $env:Path = "$nodeDirectory;$env:Path"
+    }
+
     $command = Get-Command pnpm.cmd -ErrorAction SilentlyContinue
     if ($null -ne $command) {
         return $command.Source
@@ -78,6 +97,57 @@ function Find-PnpmCommand {
     }
 
     throw "pnpm was not found. Install Node.js and pnpm, then retry."
+}
+
+function Invoke-ReleaseBuild {
+    param([Parameter(Mandatory = $true)][string]$PnpmPath)
+
+    # Tauri runs beforeBuildCommand as a child process. The shortcut may find the
+    # bundled pnpm by absolute path even though its directory is absent from PATH.
+    # Add only that already-resolved executable directory so the nested `pnpm build`
+    # uses the same trusted runtime instead of failing or resolving another shim.
+    $pnpmDirectory = Split-Path -Parent $PnpmPath
+    $pathEntries = $env:Path -split [IO.Path]::PathSeparator
+    if ($pathEntries -notcontains $pnpmDirectory) {
+        $env:Path = "$pnpmDirectory$([IO.Path]::PathSeparator)$env:Path"
+    }
+
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $env:ComSpec
+    $startInfo.Arguments = "/d /s /c `"`"$PnpmPath`" tauri build --no-bundle`""
+    $startInfo.WorkingDirectory = $repoRoot
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) {
+            throw "The Investa release build process did not start."
+        }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit([int][TimeSpan]::FromMinutes(15).TotalMilliseconds)) {
+            try { $process.Kill() } catch {}
+            throw "The Investa release build exceeded 15 minutes and was stopped."
+        }
+        $process.WaitForExit()
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        foreach ($output in @($stdout, $stderr)) {
+            if (-not [string]::IsNullOrWhiteSpace($output)) {
+                Add-Content -LiteralPath $launcherLog -Value $output -Encoding utf8
+            }
+        }
+
+        if ($process.ExitCode -ne 0) {
+            throw "The Investa release build failed with exit code $($process.ExitCode)."
+        }
+    }
+    finally {
+        $process.Dispose()
+    }
 }
 
 function Show-LauncherError {
@@ -109,15 +179,38 @@ try {
     $needsBuild = (-not $exeExists) -or ($exeWriteUtc -lt $latestInputUtc)
 
     if ($CheckOnly) {
+        $runtimeReady = $true
+        $runtimeError = $null
+        $pnpmPath = $null
+        $nodePath = $null
+        try {
+            $pnpmPath = Find-PnpmCommand
+            $nodePath = (Get-Command node.exe -ErrorAction Stop).Source
+        }
+        catch {
+            $runtimeReady = $false
+            $runtimeError = $_.Exception.Message
+        }
         [pscustomobject]@{
             repoRoot = $repoRoot
             releaseExe = $releaseExe
             exeExists = $exeExists
             needsBuild = $needsBuild
+            runtimeReady = $runtimeReady
+            nodePath = $nodePath
+            pnpmPath = $pnpmPath
+            runtimeError = $runtimeError
             latestInputUtc = $latestInputUtc.ToString("o")
             exeWriteUtc = if ($null -ne $exeWriteUtc) { $exeWriteUtc.ToString("o") } else { $null }
         } | ConvertTo-Json -Compress
         exit 0
+    }
+
+    if ($needsBuild) {
+        $pnpm = Find-PnpmCommand
+        Write-LauncherLog "The release is older than its inputs; starting an incremental build."
+        Invoke-ReleaseBuild -PnpmPath $pnpm
+        Write-LauncherLog "The incremental release build completed."
     }
 
     $runningWindow = Get-Process -Name "investa" -ErrorAction SilentlyContinue |
@@ -126,22 +219,6 @@ try {
     if ($null -ne $runningWindow) {
         (New-Object -ComObject WScript.Shell).AppActivate($runningWindow.Id) | Out-Null
         exit 0
-    }
-
-    if ($needsBuild) {
-        $pnpm = Find-PnpmCommand
-        Write-LauncherLog "The release is older than its inputs; starting an incremental build."
-        Push-Location $repoRoot
-        try {
-            & $pnpm tauri build --no-bundle *>> $launcherLog
-            if ($LASTEXITCODE -ne 0) {
-                throw "The Investa release build failed."
-            }
-        }
-        finally {
-            Pop-Location
-        }
-        Write-LauncherLog "The incremental release build completed."
     }
 
     if (-not (Test-Path -LiteralPath $releaseExe)) {

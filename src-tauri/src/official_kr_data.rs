@@ -6,6 +6,8 @@ use std::time::Duration;
 
 const KEYRING_SERVICE: &str = "Investa.OfficialKrData";
 const OPENDART_ENDPOINT: &str = "https://opendart.fss.or.kr/api/list.json";
+const OPENDART_COMPANY_SPLIT_ENDPOINT: &str = "https://opendart.fss.or.kr/api/cmpDvDecsn.json";
+const DART_CORP_SEARCH_ENDPOINT: &str = "https://dart.fss.or.kr/corp/searchCorp.ax";
 const NAVER_NEWS_ENDPOINT: &str = "https://openapi.naver.com/v1/search/news.json";
 const REQUEST_TIMEOUT_SECONDS: u64 = 10;
 const MAX_RESPONSE_BYTES: usize = 1_048_576;
@@ -57,6 +59,23 @@ pub struct OpenDartDisclosureRequest {
     page_count: Option<u16>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenDartCompanyDisclosureRequest {
+    stock_code: String,
+    begin_date: String,
+    end_date: String,
+    page_count: Option<u16>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenDartCompanySplitRequest {
+    stock_code: String,
+    begin_date: String,
+    end_date: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct OpenDartDisclosure {
@@ -78,6 +97,45 @@ pub struct OpenDartDisclosureSnapshot {
     end_date: String,
     fetched_at_ms: u64,
     items: Vec<OpenDartDisclosure>,
+    read_only: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenDartCompanySplitDecision {
+    receipt_number: String,
+    corporation_name: String,
+    split_method: String,
+    split_impact: String,
+    split_ratio: String,
+    surviving_company_name: String,
+    surviving_company_listing_status: String,
+    new_company_name: String,
+    new_company_relisting_applied: String,
+    capital_reduction_ratio: String,
+    trading_suspension_start: String,
+    trading_suspension_end: String,
+    new_share_allocation_condition: String,
+    proportional_allocation_reason: String,
+    new_share_record_date: String,
+    new_share_delivery_date: String,
+    new_share_listing_date: String,
+    shareholder_meeting_date: String,
+    split_effective_date: String,
+    split_registration_date: String,
+    board_decision_date: String,
+    source_url: String,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenDartCompanySplitSnapshot {
+    provider: &'static str,
+    corp_code: String,
+    begin_date: String,
+    end_date: String,
+    fetched_at_ms: u64,
+    items: Vec<OpenDartCompanySplitDecision>,
     read_only: bool,
 }
 
@@ -130,6 +188,58 @@ struct OpenDartRawItem {
     rcept_dt: String,
     #[serde(default)]
     rm: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenDartCompanySplitEnvelope {
+    status: String,
+    message: String,
+    #[serde(default)]
+    list: Vec<OpenDartCompanySplitRawItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenDartCompanySplitRawItem {
+    rcept_no: String,
+    corp_name: String,
+    #[serde(default)]
+    dv_mth: String,
+    #[serde(default)]
+    dv_impef: String,
+    #[serde(default)]
+    dv_rt: String,
+    #[serde(default)]
+    atdv_excmp_cmpnm: String,
+    #[serde(default)]
+    atdv_excmp_atdv_lstmn_atn: String,
+    #[serde(default)]
+    dvfcmp_cmpnm: String,
+    #[serde(default)]
+    dvfcmp_rlst_atn: String,
+    #[serde(default)]
+    abcr_crrt: String,
+    #[serde(default)]
+    abcr_trspprpd_bgd: String,
+    #[serde(default)]
+    abcr_trspprpd_edd: String,
+    #[serde(default)]
+    abcr_nstkascnd: String,
+    #[serde(default)]
+    abcr_shstkcnt_rt_at_rs: String,
+    #[serde(default)]
+    abcr_nstkasstd: String,
+    #[serde(default)]
+    abcr_nstkdlprd: String,
+    #[serde(default)]
+    abcr_nstklstprd: String,
+    #[serde(default)]
+    gmtsck_prd: String,
+    #[serde(default)]
+    dvdt: String,
+    #[serde(default)]
+    dvrgsprd: String,
+    #[serde(default)]
+    bddd: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -306,6 +416,74 @@ async fn bounded_json<T: DeserializeOwned>(
         .map_err(|_| format!("{provider} 응답 형식을 확인하지 못했습니다."))
 }
 
+async fn bounded_utf8(response: reqwest::Response, provider: &str) -> Result<String, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+    {
+        return Err(format!("{provider} 응답 크기가 허용 범위를 초과했습니다."));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|_| format!("{provider} 응답을 읽지 못했습니다."))?;
+    if bytes.len() > MAX_RESPONSE_BYTES {
+        return Err(format!("{provider} 응답 크기가 허용 범위를 초과했습니다."));
+    }
+    String::from_utf8(bytes.to_vec())
+        .map_err(|_| format!("{provider} 응답 인코딩을 확인하지 못했습니다."))
+}
+
+fn validate_stock_code(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.len() != 6 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("DART 회사 조회용 종목코드는 숫자 6자리여야 합니다.".to_owned());
+    }
+    Ok(value.to_owned())
+}
+
+fn parse_dart_corp_code(html: &str, stock_code: &str) -> Result<String, String> {
+    let stock_marker = format!(">{stock_code}</td>");
+    let stock_position = html
+        .find(&stock_marker)
+        .ok_or_else(|| "DART 회사검색에서 종목코드를 찾지 못했습니다.".to_owned())?;
+    let prefix = &html[..stock_position];
+    let field_position = prefix
+        .rfind("name='hiddenCikCD")
+        .ok_or_else(|| "DART 회사 고유번호 응답을 확인하지 못했습니다.".to_owned())?;
+    let field = &prefix[field_position..];
+    let value_position = field
+        .find("value='")
+        .map(|position| position + "value='".len())
+        .ok_or_else(|| "DART 회사 고유번호 응답을 확인하지 못했습니다.".to_owned())?;
+    let value = field[value_position..]
+        .split('\'')
+        .next()
+        .unwrap_or_default();
+    if value.len() != 8 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("DART 회사 고유번호 형식이 올바르지 않습니다.".to_owned());
+    }
+    Ok(value.to_owned())
+}
+
+async fn resolve_dart_corp_code(client: &Client, stock_code: &str) -> Result<String, String> {
+    let response = client
+        .get(DART_CORP_SEARCH_ENDPOINT)
+        .query(&[
+            ("textCrpNm", stock_code),
+            ("currentPage", "1"),
+            ("maxResults", "15"),
+            ("maxLinks", "10"),
+        ])
+        .send()
+        .await
+        .map_err(|_| "DART 회사검색에 연결하지 못했습니다.".to_owned())?;
+    if !response.status().is_success() {
+        return Err(safe_http_error("DART 회사검색", response.status()));
+    }
+    parse_dart_corp_code(&bounded_utf8(response, "DART 회사검색").await?, stock_code)
+}
+
 fn validate_news_request(request: NaverNewsRequest) -> Result<NaverNewsRequest, String> {
     let query = request.query.trim();
     if query.is_empty()
@@ -361,6 +539,56 @@ fn parse_opendart(value: OpenDartEnvelope) -> Result<Vec<OpenDartDisclosure>, St
             filer_name: bounded_text(item.flr_nm, 200),
             receipt_date: bounded_text(item.rcept_dt, 8),
             remark: bounded_text(item.rm, 200),
+        })
+        .collect())
+}
+
+fn parse_opendart_company_splits(
+    value: OpenDartCompanySplitEnvelope,
+) -> Result<Vec<OpenDartCompanySplitDecision>, String> {
+    if value.status == "013" {
+        return Ok(Vec::new());
+    }
+    if value.status != "000" {
+        let _ = value.message;
+        return Err(
+            "OpenDART 회사분할 조회가 거부되었습니다. 회사 코드·기간·호출 한도를 확인해 주세요."
+                .to_owned(),
+        );
+    }
+    Ok(value
+        .list
+        .into_iter()
+        .filter(|item| {
+            item.rcept_no.len() == 14 && item.rcept_no.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        .take(100)
+        .map(|item| OpenDartCompanySplitDecision {
+            source_url: format!(
+                "https://dart.fss.or.kr/dsaf001/main.do?rcpNo={}",
+                item.rcept_no
+            ),
+            receipt_number: item.rcept_no,
+            corporation_name: bounded_text(item.corp_name, 200),
+            split_method: bounded_text(item.dv_mth, 1_000),
+            split_impact: bounded_text(item.dv_impef, 2_000),
+            split_ratio: bounded_text(item.dv_rt, 500),
+            surviving_company_name: bounded_text(item.atdv_excmp_cmpnm, 200),
+            surviving_company_listing_status: bounded_text(item.atdv_excmp_atdv_lstmn_atn, 500),
+            new_company_name: bounded_text(item.dvfcmp_cmpnm, 200),
+            new_company_relisting_applied: bounded_text(item.dvfcmp_rlst_atn, 500),
+            capital_reduction_ratio: bounded_text(item.abcr_crrt, 500),
+            trading_suspension_start: bounded_text(item.abcr_trspprpd_bgd, 100),
+            trading_suspension_end: bounded_text(item.abcr_trspprpd_edd, 100),
+            new_share_allocation_condition: bounded_text(item.abcr_nstkascnd, 1_000),
+            proportional_allocation_reason: bounded_text(item.abcr_shstkcnt_rt_at_rs, 1_000),
+            new_share_record_date: bounded_text(item.abcr_nstkasstd, 100),
+            new_share_delivery_date: bounded_text(item.abcr_nstkdlprd, 100),
+            new_share_listing_date: bounded_text(item.abcr_nstklstprd, 100),
+            shareholder_meeting_date: bounded_text(item.gmtsck_prd, 100),
+            split_effective_date: bounded_text(item.dvdt, 100),
+            split_registration_date: bounded_text(item.dvrgsprd, 100),
+            board_decision_date: bounded_text(item.bddd, 100),
         })
         .collect())
 }
@@ -477,6 +705,67 @@ pub async fn opendart_disclosures(
 }
 
 #[tauri::command]
+pub async fn opendart_company_disclosures(
+    bridge: tauri::State<'_, OfficialKrDataBridge>,
+    request: OpenDartCompanyDisclosureRequest,
+) -> Result<OpenDartDisclosureSnapshot, String> {
+    let stock_code = validate_stock_code(&request.stock_code)?;
+    let corp_code = resolve_dart_corp_code(&bridge.client, &stock_code).await?;
+    opendart_disclosures(
+        bridge,
+        OpenDartDisclosureRequest {
+            corp_code,
+            begin_date: request.begin_date,
+            end_date: request.end_date,
+            page_count: request.page_count,
+        },
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn opendart_company_split_decisions(
+    bridge: tauri::State<'_, OfficialKrDataBridge>,
+    request: OpenDartCompanySplitRequest,
+) -> Result<OpenDartCompanySplitSnapshot, String> {
+    let stock_code = validate_stock_code(&request.stock_code)?;
+    if !valid_date(&request.begin_date)
+        || !valid_date(&request.end_date)
+        || request.begin_date > request.end_date
+    {
+        return Err("OpenDART 회사분할 조회 기간을 확인해 주세요.".to_owned());
+    }
+    let api_key = optional_secret("opendart-api-key")?
+        .ok_or_else(|| "OpenDART API 키를 먼저 설정해 주세요.".to_owned())?;
+    let corp_code = resolve_dart_corp_code(&bridge.client, &stock_code).await?;
+    let response = bridge
+        .client
+        .get(OPENDART_COMPANY_SPLIT_ENDPOINT)
+        .query(&[
+            ("crtfc_key", api_key.as_str()),
+            ("corp_code", corp_code.as_str()),
+            ("bgn_de", request.begin_date.as_str()),
+            ("end_de", request.end_date.as_str()),
+        ])
+        .send()
+        .await
+        .map_err(|_| "OpenDART 회사분할 정보에 연결하지 못했습니다.".to_owned())?;
+    if !response.status().is_success() {
+        return Err(safe_http_error("OpenDART 회사분할", response.status()));
+    }
+    let items = parse_opendart_company_splits(bounded_json(response, "OpenDART 회사분할").await?)?;
+    Ok(OpenDartCompanySplitSnapshot {
+        provider: "OPENDART_COMPANY_SPLIT_DECISIONS",
+        corp_code,
+        begin_date: request.begin_date,
+        end_date: request.end_date,
+        fetched_at_ms: crate::persistence::now_ms()?,
+        items,
+        read_only: true,
+    })
+}
+
+#[tauri::command]
 pub async fn naver_news_search(
     bridge: tauri::State<'_, OfficialKrDataBridge>,
     request: NaverNewsRequest,
@@ -536,6 +825,15 @@ mod tests {
     }
 
     #[test]
+    fn resolves_exact_stock_code_from_bounded_dart_company_html() {
+        let html = "<tr><td><input type='hidden' name='hiddenCikCD1' value='00160588'></td><td>한화</td><td>000880</td></tr>";
+        assert_eq!(parse_dart_corp_code(html, "000880").unwrap(), "00160588");
+        assert!(parse_dart_corp_code(html, "005930").is_err());
+        assert!(validate_stock_code("000880").is_ok());
+        assert!(validate_stock_code("00088A").is_err());
+    }
+
+    #[test]
     fn parses_disclosures_without_exposing_the_api_key() {
         let envelope: OpenDartEnvelope = serde_json::from_value(json!({
             "status":"000","message":"정상","list":[{
@@ -547,6 +845,26 @@ mod tests {
         let items = parse_opendart(envelope).unwrap();
         assert_eq!(items.len(), 1);
         assert!(items[0].source_url.ends_with("20260319001234"));
+    }
+
+    #[test]
+    fn parses_company_split_decisions_as_bounded_official_evidence() {
+        let envelope: OpenDartCompanySplitEnvelope = serde_json::from_value(json!({
+            "status":"000","message":"정상","list":[{
+                "rcept_no":"20260904001234","corp_name":"한화","dv_mth":"인적분할",
+                "dv_impef":"사업부문 분리","dv_rt":"0.76 : 0.24",
+                "atdv_excmp_cmpnm":"한화","atdv_excmp_atdv_lstmn_atn":"상장 유지",
+                "dvfcmp_cmpnm":"한화비전홀딩스","dvfcmp_rlst_atn":"재상장 신청",
+                "abcr_nstkascnd":"기준일 주주 비례 배정","abcr_nstkasstd":"20260801",
+                "abcr_nstklstprd":"20260901","dvdt":"20260802","bddd":"20260601"
+            }]
+        }))
+        .unwrap();
+        let items = parse_opendart_company_splits(envelope).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].split_method, "인적분할");
+        assert_eq!(items[0].new_share_record_date, "20260801");
+        assert!(items[0].source_url.ends_with("20260904001234"));
     }
 
     #[test]

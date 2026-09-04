@@ -1137,6 +1137,7 @@ pub struct WorkflowStartRequest {
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowCheckpointRequest {
     pub job_id: String,
+    pub importance: Option<String>,
     pub stage: String,
     pub selected_department_ids: Vec<String>,
     pub reports: Value,
@@ -1183,7 +1184,19 @@ pub fn meeting_workflow_checkpoint(
     request: WorkflowCheckpointRequest,
     persistence: State<'_, PersistenceBridge>,
 ) -> Result<(), String> {
+    checkpoint_meeting_workflow(&request, &persistence, persistence::now_ms()?)
+}
+
+fn checkpoint_meeting_workflow(
+    request: &WorkflowCheckpointRequest,
+    persistence: &PersistenceBridge,
+    now: u64,
+) -> Result<(), String> {
     if !valid_id(&request.job_id)
+        || request
+            .importance
+            .as_ref()
+            .is_some_and(|importance| !matches!(importance.as_str(), "normal" | "important"))
         || !matches!(
             request.stage.as_str(),
             "routing"
@@ -1203,17 +1216,17 @@ pub fn meeting_workflow_checkpoint(
     {
         return Err("회의 체크포인트가 올바르지 않습니다.".to_owned());
     }
-    let status = request.status.unwrap_or_else(|| "active".to_owned());
-    if !matches!(status.as_str(), "active" | "cancelled" | "completed") {
+    let status = request.status.as_deref().unwrap_or("active");
+    if !matches!(status, "active" | "cancelled" | "completed") {
         return Err("회의 상태가 올바르지 않습니다.".to_owned());
     }
-    let now = persistence::now_ms()?;
     let departments = serde_json::to_string(&request.selected_department_ids)
         .map_err(|error| format!("부서 목록을 기록하지 못했습니다: {error}"))?;
     let reports = serde_json::to_string(&request.reports)
         .map_err(|error| format!("보고 체크포인트를 기록하지 못했습니다: {error}"))?;
     let synthesis = request
         .synthesis
+        .as_ref()
         .map(|value| serde_json::to_string(&value))
         .transpose()
         .map_err(|error| format!("종합 보고를 기록하지 못했습니다: {error}"))?;
@@ -1228,8 +1241,8 @@ pub fn meeting_workflow_checkpoint(
         .connection
         .lock()
         .map_err(|_| "로컬 저장소 잠금을 획득하지 못했습니다.".to_owned())?;
-    let changed = connection.execute("UPDATE workflow_jobs SET stage = ?2, status = ?3, selected_departments_json = ?4, reports_json = ?5, synthesis_json = ?6, updated_at_ms = ?7 WHERE job_id = ?1",
-        params![request.job_id, request.stage, status, departments, reports, synthesis, now]).map_err(|error| format!("회의 체크포인트를 저장하지 못했습니다: {error}"))?;
+    let changed = connection.execute("UPDATE workflow_jobs SET stage = ?2, status = ?3, selected_departments_json = ?4, reports_json = ?5, synthesis_json = ?6, updated_at_ms = ?7, importance = COALESCE(?8, importance) WHERE job_id = ?1",
+        params![request.job_id, request.stage, status, departments, reports, synthesis, now, request.importance]).map_err(|error| format!("회의 체크포인트를 저장하지 못했습니다: {error}"))?;
     if changed == 0 {
         return Err("체크포인트를 저장할 회의 작업을 찾지 못했습니다.".to_owned());
     }
@@ -1512,6 +1525,58 @@ mod tests {
         let second = recover_interrupted_workflows(&persistence, 4).expect("repeat recover");
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].reports, first[0].reports);
+    }
+
+    #[test]
+    fn meeting_checkpoint_persists_effective_importance_and_rejects_unknown_values() {
+        let persistence = PersistenceBridge::in_memory().expect("database");
+        {
+            let connection = persistence.connection.lock().expect("connection");
+            connection.execute(
+                "INSERT INTO workflow_jobs(job_id,topic,importance,stage,status,selected_departments_json,reports_json,synthesis_json,created_at_ms,updated_at_ms) VALUES('importance-1','자동 중요도 승격','normal','routing','active','[]','{}',NULL,1,1)",
+                [],
+            ).expect("fixture");
+        }
+        checkpoint_meeting_workflow(
+            &WorkflowCheckpointRequest {
+                job_id: "importance-1".to_owned(),
+                importance: Some("important".to_owned()),
+                stage: "department-analysis".to_owned(),
+                selected_department_ids: vec!["research".to_owned()],
+                reports: json!({}),
+                synthesis: None,
+                status: None,
+            },
+            &persistence,
+            2,
+        )
+        .expect("checkpoint");
+        let connection = persistence.connection.lock().expect("connection");
+        let stored: String = connection
+            .query_row(
+                "SELECT importance FROM workflow_jobs WHERE job_id='importance-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("stored importance");
+        assert_eq!(stored, "important");
+        drop(connection);
+
+        let error = checkpoint_meeting_workflow(
+            &WorkflowCheckpointRequest {
+                job_id: "importance-1".to_owned(),
+                importance: Some("urgent".to_owned()),
+                stage: "department-analysis".to_owned(),
+                selected_department_ids: vec![],
+                reports: json!({}),
+                synthesis: None,
+                status: None,
+            },
+            &persistence,
+            3,
+        )
+        .expect_err("unknown importance");
+        assert!(error.contains("체크포인트"));
     }
 
     #[test]

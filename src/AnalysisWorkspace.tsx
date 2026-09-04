@@ -3,9 +3,20 @@ import { invoke } from "@tauri-apps/api/core";
 import { forecastAssetMarket, type AnalysisMarket } from "./analysisMarket";
 import { TechnicalChartEvidenceView } from "./TechnicalChartEvidenceView";
 import type { TechnicalChartEvidence } from "./technicalChartEvidence";
+import { PortfolioOverview, type PortfolioRecordSnapshot } from "./PortfolioOverview";
+import type { ExternalEvidenceSource } from "./externalEvidenceSources";
 
 type AnalysisFilter = "all" | "strategy" | Exclude<AnalysisMarket, "mixed">;
 type AnalysisClassification = "all" | "system_check" | "research_experiment" | "promotion_candidate";
+type DepartmentRecordReport = {
+  departmentName: string;
+  conclusion: "proceed" | "watch" | "reject" | "out_of_scope";
+  confidencePercent: number;
+  summary: string;
+  roleFindings: Array<{ agentId: string; role: string; finding: string; evidenceIds: string[]; counterevidence: string[]; evidenceGap?: string | null }>;
+  risks: string[];
+  nextActions: string[];
+};
 type AnalysisSummary = {
   recordId: string;
   kind: "strategy" | "instrument" | "meeting";
@@ -30,17 +41,23 @@ type AnalysisDetail = {
     type?: "meeting" | "strategy_review" | "role_report" | "department_delegation";
     topic?: string;
     synthesis?: { decision: string; summary: string; consensus: string[]; disagreements: string[]; conditions: string[] };
-    reports?: Record<string, { departmentName: string; summary: string }>;
-    review?: { executable: boolean; issues: Array<{ field: string; message: string }> };
-    departmentReport?: {
-      departmentName: string;
-      conclusion: "proceed" | "watch" | "reject" | "out_of_scope";
-      confidencePercent: number;
-      summary: string;
-      roleFindings: Array<{ agentId: string; role: string; finding: string; evidenceIds: string[]; counterevidence: string[]; evidenceGap?: string | null }>;
-      risks: string[];
-      nextActions: string[];
+    reports?: Record<string, DepartmentRecordReport>;
+    portfolio?: PortfolioRecordSnapshot;
+    portfolioCharts?: TechnicalChartEvidence[];
+    telegramEvidence?: {
+      provider: string;
+      asOfMs?: number | null;
+      totalAvailableCount: number;
+      includedCount: number;
+      snapshotCandidateCount?: number;
+      retrievedCount?: number;
+      selectedSourceCount: number;
+      syncStatus: string;
+      message: string;
     };
+    evidenceSources?: ExternalEvidenceSource[];
+    review?: { executable: boolean; issues: Array<{ field: string; message: string }> };
+    departmentReport?: DepartmentRecordReport;
     report?: {
       request?: string;
       evidence?: Array<{ evidenceId: string; kind?: string; sourceUrl?: string; summary?: string; source?: string; sourceRevision?: string | null; observation?: string; counterevidence?: string[]; observedAt?: string | null }>;
@@ -181,6 +198,18 @@ type ForecastTrace = {
     metrics: { sampleCount: number; brierScoreMillionths: number; logLossMillionths: number; expectedCalibrationErrorBps: number; populatedBinCount: number };
   } | null;
 };
+type MarketScreenerPreset = "balanced" | "momentum" | "reversal";
+type MarketScreenerCandidate = {
+  symbol: string; name: string; market: string; currency: string; latestPriceMinor: number;
+  coarseScoreBps: number; screeningScoreBps: number; twentyDayReturnBps: number;
+  rsi14Bps: number; averageVolume20d: number; reasons: string[];
+};
+type MarketScreenerResult = {
+  provider: string; market: "kr" | "us"; preset: MarketScreenerPreset; asOfMs: number;
+  rankedAt: string[]; coarseUniverseCount: number; technicalEvaluatedCount: number;
+  excludedCount: number; candidates: MarketScreenerCandidate[]; warnings: string[];
+  errors: string[]; liveOrderEnabled: boolean;
+};
 
 const FILTERS: Array<{ id: AnalysisFilter; label: string }> = [
   { id: "all", label: "전체" },
@@ -216,7 +245,86 @@ const regimeLabel = (regime: WalkForwardReport["folds"][number]["regimes"][numbe
 const forecastAssetLabel: Record<ForecastTrace["forecast"]["assetClass"], string> = { korea_stock: "국내주식", united_states_stock: "미국주식", equity_future: "주식선물", index_future: "지수선물", crypto_spot: "코인현물", crypto_perpetual: "코인선물" };
 const evidenceModeLabel: Record<ForecastTrace["forecast"]["evidenceMode"], string> = { full_features: "전체 피처", price_only_fallback: "가격 전용 fallback", unavailable: "산출 불가" };
 
-export function AnalysisWorkspace({ refreshToken }: { refreshToken: number }) {
+const conclusionLabel = (conclusion: DepartmentRecordReport["conclusion"]) => ({
+  proceed: "검토 진행",
+  watch: "관찰",
+  reject: "기각",
+  out_of_scope: "범위 밖",
+})[conclusion];
+
+function DepartmentReportPanel({ id, report }: { id: string; report: DepartmentRecordReport }) {
+  const uniqueEvidenceIds = new Set(report.roleFindings.flatMap((item) => item.evidenceIds));
+  const evidencedRoleCount = report.roleFindings.filter((item) => item.evidenceIds.length > 0).length;
+  const gapRoleCount = report.roleFindings.filter((item) => Boolean(item.evidenceGap)).length;
+  return <details className="department-report-panel" open>
+    <summary>
+      <span><small>DEPARTMENT REPORT</small><strong>{report.departmentName}</strong></span>
+      <span className="department-report-score"><b>{report.confidencePercent}%</b><small>{conclusionLabel(report.conclusion)} · 부서 자체평가</small></span>
+    </summary>
+    <div className="department-report-body" id={`department-report-${id}`}>
+      <section className="department-report-summary"><h4>부서 종합</h4><p>{report.summary}</p></section>
+      <section className="department-evidence-audit" aria-label={`${report.departmentName} 근거 충족도 진단`}>
+        <h4>근거 충족도 진단</h4>
+        <dl><div><dt>부서 자체평가</dt><dd>{report.confidencePercent}%</dd></div><div><dt>고유 근거 ID</dt><dd>{uniqueEvidenceIds.size}개</dd></div><div><dt>근거가 있는 직원</dt><dd>{evidencedRoleCount}/{report.roleFindings.length}명</dd></div><div><dt>근거 공백이 남은 직원</dt><dd>{gapRoleCount}명</dd></div></dl>
+        <p>이 수치는 상승 확률이나 모델 신뢰도가 아닙니다. 직원이 인용한 근거의 공식성·최신성·교차검증·시점 정합성에 대한 부서 자체평가이며, 아래 근거 ID와 공백을 함께 확인해야 합니다.</p>
+      </section>
+      <section><h4>직원별 상세 분석</h4><div className="department-role-reports">
+        {report.roleFindings.map((item) => <article key={item.agentId}>
+          <header><strong>{item.role}</strong><code>{item.agentId}</code></header>
+          <p>{item.finding}</p>
+          {item.evidenceIds.length > 0 && <div className="department-report-evidence"><b>근거 ID</b><span>{item.evidenceIds.join(" · ")}</span></div>}
+          {item.counterevidence.length > 0 && <div className="department-report-counter"><b>반대 근거</b><ul>{item.counterevidence.map((counter, index) => <li key={`${index}-${counter}`}>{counter}</li>)}</ul></div>}
+          {item.evidenceGap && <div className="department-report-gap"><b>근거 공백</b><p>{item.evidenceGap}</p></div>}
+        </article>)}
+      </div></section>
+      <div className="department-report-columns">
+        <section><h4>위험·반대 조건</h4>{report.risks.length ? <ul>{report.risks.map((risk, index) => <li key={`${index}-${risk}`}>{risk}</li>)}</ul> : <p>별도로 기록된 위험이 없습니다.</p>}</section>
+        <section><h4>추가 확인·후속 조치</h4>{report.nextActions.length ? <ol>{report.nextActions.map((action, index) => <li key={`${index}-${action}`}>{action}</li>)}</ol> : <p>별도로 기록된 후속 조치가 없습니다.</p>}</section>
+      </div>
+    </div>
+  </details>;
+}
+
+function PortfolioCharts({ charts }: { charts?: TechnicalChartEvidence[] }) {
+  if (!charts?.length) return <section className="portfolio-chart-evidence-empty"><span>PORTFOLIO CHARTS</span><h3>종목별 분석 차트</h3><p>분석 당시 완료 OHLCV가 20봉 미만이거나 가격 스냅샷을 만들지 못해 선이 그어진 차트를 보존하지 못했습니다.</p></section>;
+  return <section className="portfolio-chart-evidence-list" aria-labelledby="portfolio-chart-evidence-heading">
+    <header><span>PORTFOLIO CHARTS · POINT IN TIME</span><h3 id="portfolio-chart-evidence-heading">보유종목별 차트와 관측선</h3><p>각 차트는 분석 당시 완료 봉으로 고·저점, 저점 연결 추세선과 최근 가격 범위를 다시 계산하지 않고 보존한 자료입니다.</p></header>
+    {charts.map((chart) => <TechnicalChartEvidenceView key={`${chart.sourceSnapshotId}-${chart.symbol}`} evidence={chart} />)}
+  </section>;
+}
+
+function TelegramEvidenceStatus({ value, hasDetailedTrace }: { value: NonNullable<AnalysisDetail["record"]["telegramEvidence"]>; hasDetailedTrace: boolean }) {
+  const candidateCount = value.snapshotCandidateCount ?? value.includedCount;
+  return <section className="analysis-evidence-status" aria-label="Telegram 근거 연결 상태">
+    <div><span>TELEGRAM EVIDENCE</span><strong>{hasDetailedTrace ? value.includedCount > 0 ? "보고 인용됨" : "보고 인용 0건" : "과거 기록 · 인용 여부 미분리"}</strong></div>
+    <dl>
+      <div><dt>기간 내 저장</dt><dd>{value.totalAvailableCount}건</dd></div>
+      <div><dt>분석 후보</dt><dd>{candidateCount}건</dd></div>
+      <div><dt>{hasDetailedTrace ? "직원 조회 / 보고 인용" : "과거 포함 표기"}</dt><dd>{hasDetailedTrace ? `${value.retrievedCount ?? 0} / ${value.includedCount}건` : `${value.includedCount}건`}</dd></div>
+      <div><dt>선택 채널</dt><dd>{value.selectedSourceCount}개</dd></div>
+    </dl>
+    <p>{value.syncStatus} · {value.message}{!hasDetailedTrace ? " · 이 기록은 구버전이라 후보 수와 실제 인용 수를 구분할 수 없습니다." : ""}</p>
+  </section>;
+}
+
+function ExternalEvidenceSources({ sources }: { sources?: ExternalEvidenceSource[] }) {
+  if (!sources) return null;
+  const citedCount = sources.filter((source) => source.cited).length;
+  return <section className="external-evidence-sources" aria-labelledby="external-evidence-source-heading">
+    <header><span>SOURCE PROVENANCE</span><h3 id="external-evidence-source-heading">뉴스·Telegram·공시 원문 계보</h3><p>직원이 실제로 조회한 자료와 보고서에 인용한 자료를 구분합니다. 외부 내용은 지시가 아닌 근거로만 취급합니다.</p></header>
+    <p className="external-evidence-summary">조회 {sources.length}건 · 보고 인용 {citedCount}건</p>
+    {sources.length ? <ul>{sources.map((source) => <li key={source.evidenceId}>
+      <div><span data-provider={source.medium}>{source.medium === "news" ? "네이버 뉴스" : source.medium === "telegram" ? "Telegram" : "OpenDART"}</span><strong>{source.cited ? "보고 인용" : "조회만 함"}</strong></div>
+      <h4>{source.title}</h4>
+      <p>{source.sourceName} · {source.publishedAt ?? "발행 시각 미기록"}</p>
+      <small>{source.sourceUrl ?? "공개 원문 URL 없음"}</small>
+      {source.platformUrl && <small>네이버 제공 링크: {source.platformUrl}</small>}
+      <code>{source.evidenceId}</code>
+    </li>)}</ul> : <p>이 분석에서 직원이 조회한 네이버 뉴스·Telegram·OpenDART 원문이 없습니다.</p>}
+  </section>;
+}
+
+export function AnalysisWorkspace({ refreshToken, onAnalyzeCandidate }: { refreshToken: number; onAnalyzeCandidate?: (candidate: MarketScreenerCandidate) => void }) {
   const [records, setRecords] = useState<AnalysisSummary[]>([]);
   const [filter, setFilter] = useState<AnalysisFilter>("all");
   const [classification, setClassification] = useState<AnalysisClassification>("all");
@@ -235,6 +343,11 @@ export function AnalysisWorkspace({ refreshToken }: { refreshToken: number }) {
   const [walkForwardHistory, setWalkForwardHistory] = useState<WalkForwardReport[]>([]);
   const [forecastTraces, setForecastTraces] = useState<ForecastTrace[]>([]);
   const [forecastError, setForecastError] = useState<string | null>(null);
+  const [screenerMarket, setScreenerMarket] = useState<"kr" | "us">("kr");
+  const [screenerPreset, setScreenerPreset] = useState<MarketScreenerPreset>("balanced");
+  const [screenerRunning, setScreenerRunning] = useState(false);
+  const [screenerResult, setScreenerResult] = useState<MarketScreenerResult | null>(null);
+  const [screenerError, setScreenerError] = useState<string | null>(null);
 
   const loadForecasts = async () => {
     try {
@@ -355,6 +468,22 @@ export function AnalysisWorkspace({ refreshToken }: { refreshToken: number }) {
     } catch (runError) { setError(String(runError)); }
     finally { setWalkForwardRunning(false); }
   };
+  const runMarketScreener = async () => {
+    setScreenerRunning(true);
+    setScreenerError(null);
+    try {
+      const next = await invoke<MarketScreenerResult>("toss_market_screener", { request: {
+        market: screenerMarket, preset: screenerPreset, technicalCandidateCount: 12, resultCount: 5,
+      } });
+      if (next.liveOrderEnabled) throw new Error("후보 탐색 응답의 실주문 잠금 계약이 손상되었습니다.");
+      setScreenerResult(next);
+    } catch (runError) {
+      setScreenerResult(null);
+      setScreenerError(String(runError));
+    } finally {
+      setScreenerRunning(false);
+    }
+  };
 
   return <main className="analysis-workspace">
     <header className="analysis-header">
@@ -381,6 +510,26 @@ export function AnalysisWorkspace({ refreshToken }: { refreshToken: number }) {
               </li>)}</ul>}
       </aside>
       <section className="analysis-detail" aria-live="polite">
+        <details className="market-screener-panel">
+          <summary><span>MARKET CANDIDATE PIPELINE</span><strong>시장 후보 탐색</strong><small>{screenerResult ? `${screenerResult.candidates.length}개 후보 · ${formatDateTime(screenerResult.asOfMs)}` : "토스 읽기 전용"}</small></summary>
+          <div className="market-screener-controls">
+            <label>시장<select value={screenerMarket} onChange={(event) => setScreenerMarket(event.currentTarget.value as "kr" | "us")} disabled={screenerRunning}><option value="kr">국장</option><option value="us">미장</option></select></label>
+            <label>탐색 기준<select value={screenerPreset} onChange={(event) => setScreenerPreset(event.currentTarget.value as MarketScreenerPreset)} disabled={screenerRunning}><option value="balanced">균형</option><option value="momentum">추세</option><option value="reversal">반전 관찰</option></select></label>
+            <button type="button" onClick={() => void runMarketScreener()} disabled={screenerRunning}>{screenerRunning ? "랭킹·일봉 검토 중" : "후보 탐색 실행"}</button>
+          </div>
+          <p>시장 랭킹을 저비용 1차 필터로 쓰고 상위 12종목만 일봉 기술 조건을 검토합니다. 결과는 추천·주문 승인이 아닙니다.</p>
+          {screenerError && <p className="analysis-inline-error" role="alert">후보를 탐색하지 못했습니다. {screenerError}</p>}
+          {screenerResult && <>
+            <div className="market-screener-meta"><span>1차 유니버스 {screenerResult.coarseUniverseCount}개</span><span>기술 검토 {screenerResult.technicalEvaluatedCount}개</span><span>조건 제외 {screenerResult.excludedCount}개</span><span>부분 실패 {screenerResult.errors.length}개</span></div>
+            {screenerResult.candidates.length === 0 ? <p className="market-screener-empty">현재 조건을 모두 통과한 후보가 없습니다. 조건을 자동 완화하지 않습니다.</p> : <ol className="market-screener-results">{screenerResult.candidates.map((candidate) => <li key={candidate.symbol}>
+              <div><b>{candidate.name}</b><code>{candidate.symbol} · {candidate.market}</code></div>
+              <dl><div><dt>현재가</dt><dd>{formatMoney(candidate.latestPriceMinor, candidate.currency)}</dd></div><div><dt>20일</dt><dd>{formatPercent(candidate.twentyDayReturnBps)}</dd></div><div><dt>RSI</dt><dd>{(candidate.rsi14Bps / 100).toFixed(1)}</dd></div><div><dt>1차 점수</dt><dd>{formatPercent(candidate.coarseScoreBps)}</dd></div></dl>
+              <small>{candidate.reasons.join(" · ")}</small>
+              {onAnalyzeCandidate && <button type="button" onClick={() => onAnalyzeCandidate(candidate)}>이 종목 분석 안건 만들기</button>}
+            </li>)}</ol>}
+            <ul className="market-screener-warnings">{screenerResult.warnings.map((warning) => <li key={warning}>{warning}</li>)}{screenerResult.errors.map((item) => <li key={item}>부분 실패: {item}</li>)}</ul>
+          </>}
+        </details>
         <details className="forecast-trace-panel">
           <summary><span>PROBABILITY FORECAST TRACE</span><strong>예측 기반시설</strong><small>{filteredForecastTraces.length ? `${filteredForecastTraces.length}개 불변 기록` : "조건에 맞는 기록 없음"}</small></summary>
           {forecastError ? <p className="analysis-inline-error">예측 기록을 불러오지 못했습니다. {forecastError}</p>
@@ -397,14 +546,31 @@ export function AnalysisWorkspace({ refreshToken }: { refreshToken: number }) {
             : detail.record.type === "meeting" ? <>
               <header><div><span>{MARKET_LABELS[detail.summary.market]} · 회의 종합</span><h2>{detail.summary.title}</h2><p>{detail.summary.symbol || "종목 미지정"}</p></div><strong className={detail.summary.status === "completed" ? "is-ready" : "is-blocked"}>{statusLabel(detail.summary.status)}</strong></header>
               <dl className="analysis-meta"><div><dt>분석 요청</dt><dd>{formatDateTime(detail.summary.requestedAtMs)}</dd></div><div><dt>분석 완료</dt><dd>{formatDateTime(detail.summary.completedAtMs)}</dd></div></dl>
+              {detail.record.portfolio && <PortfolioOverview snapshot={detail.record.portfolio} title="분석 당시 보유자산" />}
+              {(detail.record.portfolio || detail.record.portfolioCharts?.length) && <PortfolioCharts charts={detail.record.portfolioCharts} />}
+              {detail.record.telegramEvidence && <TelegramEvidenceStatus value={detail.record.telegramEvidence} hasDetailedTrace={Boolean(detail.record.evidenceSources)} />}
+              <ExternalEvidenceSources sources={detail.record.evidenceSources} />
               <section className="analysis-request"><span>AGENDA</span><h3>회의 안건</h3><p>{detail.record.topic}</p></section>
               <section className="analysis-result-section"><span>DECISION</span><h3>{detail.record.synthesis?.decision ?? "결정 미기록"}</h3><p>{detail.record.synthesis?.summary}</p></section>
-              <div className="analysis-result-grid"><section><span>REPORTS</span><h3>부서 보고</h3><ul>{Object.entries(detail.record.reports ?? {}).map(([id, report]) => <li key={id}><strong>{report.departmentName}</strong><small>{report.summary}</small></li>)}</ul></section><section><span>CONDITIONS</span><h3>조건·이견</h3><ul>{[...(detail.record.synthesis?.conditions ?? []), ...(detail.record.synthesis?.disagreements ?? [])].map((item, index) => <li key={`${index}-${item}`}>{item}</li>)}</ul></section></div>
+              <section className="meeting-department-report-section" aria-labelledby="meeting-department-report-heading">
+                <header><span>REPORTS · FULL TEXT</span><h3 id="meeting-department-report-heading">부서별 상세 보고</h3><p>부서 종합과 직원별 근거·반대 근거·공백을 함께 보존합니다. 각 보고는 접어서 비교할 수 있습니다.</p></header>
+                <div className="meeting-department-reports">
+                  {Object.entries(detail.record.reports ?? {}).length
+                    ? Object.entries(detail.record.reports ?? {}).map(([id, report]) => <DepartmentReportPanel key={id} id={id} report={report} />)
+                    : <p className="meeting-department-report-empty">저장된 부서 보고가 없습니다.</p>}
+                </div>
+              </section>
+              <div className="analysis-result-grid"><section><span>CONSENSUS</span><h3>부서 합의</h3><ul>{(detail.record.synthesis?.consensus ?? []).map((item, index) => <li key={`${index}-${item}`}>{item}</li>)}</ul></section><section><span>CONDITIONS</span><h3>조건·이견</h3><ul>{[...(detail.record.synthesis?.conditions ?? []), ...(detail.record.synthesis?.disagreements ?? [])].map((item, index) => <li key={`${index}-${item}`}>{item}</li>)}</ul></section></div>
             </> : detail.record.type === "department_delegation" ? <>
               <header><div><span>CODEX · 승인형 부서 종합</span><h2>{detail.summary.title}</h2><p>{detail.record.topic}</p></div><strong className={detail.record.departmentReport?.conclusion === "proceed" ? "is-ready" : "is-blocked"}>{detail.record.departmentReport?.conclusion ?? "미기록"}</strong></header>
-              <dl className="analysis-meta"><div><dt>업무 요청</dt><dd>{formatDateTime(detail.summary.requestedAtMs)}</dd></div><div><dt>종합 완료</dt><dd>{formatDateTime(detail.summary.completedAtMs)}</dd></div><div><dt>근거 충족도</dt><dd>{detail.record.departmentReport?.confidencePercent ?? 0}%</dd></div></dl>
-              <section className="analysis-result-section"><span>DEPARTMENT SUMMARY</span><h3>{detail.record.departmentReport?.departmentName}</h3><p>{detail.record.departmentReport?.summary}</p></section>
-              <div className="analysis-result-grid"><section><span>ROLE FINDINGS</span><h3>직원별 실제 결과</h3><ul>{detail.record.departmentReport?.roleFindings.map((item) => <li key={item.agentId}><strong>{item.role}</strong><small>{item.finding}{item.evidenceIds.length ? ` · 근거: ${item.evidenceIds.join(", ")}` : ""}{item.counterevidence.length ? ` · 반대 근거: ${item.counterevidence.join(" · ")}` : ""}{item.evidenceGap ? ` · 근거 공백: ${item.evidenceGap}` : ""}</small></li>)}</ul></section><section><span>RISKS / NEXT</span><h3>위험·후속 조치</h3><ul>{[...(detail.record.departmentReport?.risks ?? []), ...(detail.record.departmentReport?.nextActions ?? [])].map((item, index) => <li key={`${index}-${item}`}>{item}</li>)}</ul></section></div>
+              <dl className="analysis-meta"><div><dt>업무 요청</dt><dd>{formatDateTime(detail.summary.requestedAtMs)}</dd></div><div><dt>종합 완료</dt><dd>{formatDateTime(detail.summary.completedAtMs)}</dd></div><div><dt>부서 자체평가</dt><dd>{detail.record.departmentReport?.confidencePercent ?? 0}%</dd></div></dl>
+              {detail.record.portfolio && <PortfolioOverview snapshot={detail.record.portfolio} title="부서 분석 당시 보유자산" />}
+              {(detail.record.portfolio || detail.record.portfolioCharts?.length) && <PortfolioCharts charts={detail.record.portfolioCharts} />}
+              {detail.record.telegramEvidence && <TelegramEvidenceStatus value={detail.record.telegramEvidence} hasDetailedTrace={Boolean(detail.record.evidenceSources)} />}
+              <ExternalEvidenceSources sources={detail.record.evidenceSources} />
+              {detail.record.departmentReport
+                ? <section className="meeting-department-report-section" aria-label="부서 상세 보고"><DepartmentReportPanel id={detail.summary.recordId} report={detail.record.departmentReport} /></section>
+                : <p className="meeting-department-report-empty">저장된 부서 보고가 없습니다.</p>}
               <p className="analysis-inline-error">사용자가 승인한 부서 내부 종합입니다. 본부장 회의나 주문 후보로 자동 승격되지 않습니다.</p>
             </> : detail.record.type === "role_report" ? <>
               <header><div><span>CODEX · 개별 역할 소견</span><h2>{detail.summary.title}</h2><p>{detail.record.report?.scope}</p></div><strong className="is-ready">근거 충족도 {detail.record.report?.confidencePercent ?? 0}%</strong></header>
@@ -412,6 +578,7 @@ export function AnalysisWorkspace({ refreshToken }: { refreshToken: number }) {
               <section className="analysis-result-section"><span>ROLE-ONLY SUMMARY</span><h3>개별 소견</h3><p>{detail.record.report?.summary}</p></section>
               <div className="analysis-result-grid"><section><span>FINDINGS</span><h3>역할 한정 결과</h3><ul>{detail.record.report?.findings?.map((item, index) => <li key={`${index}-${item}`}>{item}</li>)}</ul></section><section><span>BOUNDARIES</span><h3>근거 공백·추가 요청</h3><ul>{[...(detail.record.report?.evidenceGaps ?? []), ...(detail.record.report?.nextRequests ?? [])].map((item, index) => <li key={`${index}-${item}`}>{item}</li>)}</ul></section></div>
               <section className="analysis-result-section"><span>EVIDENCE TRACE</span><h3>근거·리비전·반대 근거</h3><ul>{detail.record.report?.evidence?.map((item) => <li key={item.evidenceId}><strong>{item.evidenceId} · {item.source ?? "출처 미기록"}</strong><small>{item.sourceRevision ? `rev ${item.sourceRevision} · ` : ""}{item.observation ?? "관측 미기록"}{item.counterevidence?.length ? ` · 반대 근거: ${item.counterevidence.join(" · ")}` : ""}</small></li>)}</ul></section>
+              <ExternalEvidenceSources sources={detail.record.evidenceSources} />
               {detail.record.chartEvidence && <TechnicalChartEvidenceView evidence={detail.record.chartEvidence} />}
               <p className="analysis-inline-error">이 기록은 해당 직원의 독립 소견입니다. 전체 분석, 최종 투자 판단 또는 주문 후보가 아닙니다.</p>
             </> : <>

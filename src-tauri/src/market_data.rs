@@ -1,7 +1,7 @@
 use keyring::{Entry, Error as KeyringError};
 use reqwest::{Client, StatusCode};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::State;
@@ -11,7 +11,11 @@ use crate::{
     paper_account::{execute_shadow_order, ShadowOrderRequest},
     paper_trading::{self, PaperAccountSnapshot},
     persistence::{PersistBacktest, PersistenceBridge},
-    research::{review_research_report, ResearchReport, StrategyReview},
+    research::{review_research_report, Market, ResearchReport, StrategyReview},
+    screening::{
+        screen_candidates, InstrumentStatus, RuleOperator, ScreeningObservation, ScreeningRule,
+        ScreeningStrategy, UniverseEntry, UniverseVersion,
+    },
     sec_fundamentals::{self, SecFilingSnapshot, SecFundamentalSnapshot, SecFundamentalsBridge},
     simulation::TradingCosts,
     trading::TradeSide,
@@ -24,7 +28,13 @@ const CLIENT_SECRET_ACCOUNT: &str = "client-secret";
 const DEFAULT_REFRESH_AFTER_MS: u64 = 15_000;
 const REQUEST_TIMEOUT_SECONDS: u64 = 8;
 const STOCK_CATALOG_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const STOCK_CATALOG_REQUEST_GAP: Duration = Duration::from_millis(1_050);
 const STOCK_SEARCH_LIMIT: usize = 8;
+const SCREENER_RANKING_LIMIT: u16 = 100;
+const SCREENER_MAX_TECHNICAL_CANDIDATES: usize = 20;
+const SCREENER_DEFAULT_TECHNICAL_CANDIDATES: usize = 12;
+const SCREENER_MAX_RESULTS: usize = 10;
+const SCREENER_REQUEST_GAP_MS: u64 = 220;
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -131,6 +141,18 @@ struct TossHoldingsEnvelope {
     result: HoldingsOverview,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TossBuyingPower {
+    currency: String,
+    cash_buying_power: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TossBuyingPowerEnvelope {
+    result: TossBuyingPower,
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TossAccountOverview {
@@ -138,6 +160,8 @@ pub struct TossAccountOverview {
     masked_account_no: String,
     account_type: String,
     holdings: HoldingsOverview,
+    buying_power: Vec<TossBuyingPower>,
+    buying_power_errors: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -260,6 +284,17 @@ pub struct AnalysisSnapshotRequest {
     pub(crate) query: String,
     #[serde(default = "default_analysis_bar_count")]
     pub(crate) count: u16,
+    #[serde(default)]
+    pub(crate) instrument: Option<AnalysisInstrumentRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisInstrumentRequest {
+    symbol: String,
+    name: String,
+    market_country: String,
+    currency: String,
 }
 
 fn default_analysis_bar_count() -> u16 {
@@ -274,6 +309,13 @@ pub struct AnalysisIndicatorSnapshot {
     pub(crate) sma_60: Option<f64>,
     pub(crate) rsi_14: Option<f64>,
     pub(crate) atr_14: Option<f64>,
+    pub(crate) macd_line: Option<f64>,
+    pub(crate) macd_signal: Option<f64>,
+    pub(crate) macd_histogram: Option<f64>,
+    pub(crate) bollinger_middle: Option<f64>,
+    pub(crate) bollinger_upper: Option<f64>,
+    pub(crate) bollinger_lower: Option<f64>,
+    pub(crate) twenty_day_return_volatility_percent: Option<f64>,
     pub(crate) twenty_day_return_percent: Option<f64>,
     pub(crate) twenty_day_average_volume: Option<f64>,
 }
@@ -325,6 +367,94 @@ struct TossPrice {
     symbol: String,
     last_price: String,
     currency: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TossRankingsEnvelope {
+    result: TossRankingResult,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TossRankingResult {
+    ranked_at: Option<String>,
+    rankings: Vec<TossRankingItem>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TossRankingItem {
+    rank: u16,
+    symbol: String,
+    currency: String,
+    price: TossRankingPrice,
+    trading_volume: String,
+    trading_amount: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TossRankingPrice {
+    last_price: String,
+    base_price: String,
+    change_rate: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TossMarketScreenerRequest {
+    market: String,
+    #[serde(default = "default_screener_preset")]
+    preset: String,
+    #[serde(default = "default_screener_technical_candidates")]
+    technical_candidate_count: usize,
+    #[serde(default = "default_screener_result_count")]
+    result_count: usize,
+}
+
+fn default_screener_preset() -> String {
+    "balanced".to_owned()
+}
+
+const fn default_screener_technical_candidates() -> usize {
+    SCREENER_DEFAULT_TECHNICAL_CANDIDATES
+}
+
+const fn default_screener_result_count() -> usize {
+    5
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TossMarketScreenerCandidate {
+    symbol: String,
+    name: String,
+    market: String,
+    currency: String,
+    latest_price_minor: u64,
+    coarse_score_bps: u64,
+    screening_score_bps: u64,
+    twenty_day_return_bps: i64,
+    rsi_14_bps: i64,
+    average_volume_20d: u64,
+    reasons: Vec<String>,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TossMarketScreenerResult {
+    provider: &'static str,
+    market: String,
+    preset: String,
+    as_of_ms: u64,
+    ranked_at: Vec<String>,
+    coarse_universe_count: usize,
+    technical_evaluated_count: usize,
+    excluded_count: usize,
+    candidates: Vec<TossMarketScreenerCandidate>,
+    warnings: Vec<String>,
+    errors: Vec<String>,
+    live_order_enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -556,6 +686,7 @@ pub struct MarketDataBridge {
     token_cache: Mutex<Option<TokenCache>>,
     last_snapshot: Mutex<Option<MarketIndexSnapshot>>,
     stock_catalogs: Mutex<HashMap<String, (Instant, Vec<StockSearchResult>)>>,
+    next_stock_catalog_request: Mutex<Option<Instant>>,
 }
 
 impl Default for MarketDataBridge {
@@ -565,6 +696,7 @@ impl Default for MarketDataBridge {
             token_cache: Mutex::new(None),
             last_snapshot: Mutex::new(None),
             stock_catalogs: Mutex::new(HashMap::new()),
+            next_stock_catalog_request: Mutex::new(None),
         }
     }
 }
@@ -704,6 +836,25 @@ fn delete_stored_credentials() -> Result<(), String> {
 }
 
 impl MarketDataBridge {
+    async fn wait_for_stock_catalog_slot(&self) -> Result<(), ApiError> {
+        let delay = {
+            let now = Instant::now();
+            let mut next = self.next_stock_catalog_request.lock().map_err(|_| {
+                ApiError::new(
+                    ApiErrorKind::Unavailable,
+                    "종목 목록 요청 간격을 계산하지 못했습니다.",
+                )
+            })?;
+            let scheduled = next.map_or(now, |value| value.max(now));
+            *next = Some(scheduled + STOCK_CATALOG_REQUEST_GAP);
+            scheduled.saturating_duration_since(now)
+        };
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        Ok(())
+    }
+
     /// 토스 인증 WebSocket handshake 전용 토큰 조회입니다.
     /// 이 함수는 Rust 내부에서만 사용하고 Tauri command나 직렬화 DTO로 노출하지 않습니다.
     pub(crate) async fn toss_stream_access_token(&self) -> Result<String, String> {
@@ -1199,6 +1350,86 @@ impl MarketDataBridge {
             })
     }
 
+    async fn request_buying_power(
+        &self,
+        access_token: &str,
+        account_seq: i64,
+        currency: &str,
+    ) -> Result<TossBuyingPower, ApiError> {
+        let response = self
+            .client
+            .get(format!("{API_BASE_URL}/api/v1/buying-power"))
+            .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECONDS))
+            .header("X-Tossinvest-Account", account_seq.to_string())
+            .query(&[("currency", currency)])
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(|_| {
+                ApiError::new(
+                    ApiErrorKind::Unavailable,
+                    "토스증권 매수 가능 금액 서버에 연결하지 못했습니다.",
+                )
+            })?;
+        match response.status() {
+            StatusCode::UNAUTHORIZED => {
+                return Err(ApiError::new(
+                    ApiErrorKind::Unauthorized,
+                    "토스증권 액세스 토큰이 만료되었습니다.",
+                ))
+            }
+            StatusCode::FORBIDDEN => {
+                return Err(ApiError::new(
+                    ApiErrorKind::IpDenied,
+                    "현재 IP 또는 API 권한으로 매수 가능 금액을 조회할 수 없습니다.",
+                ))
+            }
+            StatusCode::TOO_MANY_REQUESTS => {
+                return Err(ApiError::new(
+                    ApiErrorKind::RateLimited,
+                    "토스증권 매수 가능 금액 조회 한도를 초과했습니다.",
+                ))
+            }
+            StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND => {
+                return Err(ApiError::new(
+                    ApiErrorKind::InvalidResponse,
+                    "토스증권 계좌 또는 매수 가능 통화를 확인해 주세요.",
+                ))
+            }
+            status if !status.is_success() => {
+                return Err(ApiError::provider_status(
+                    status,
+                    "토스증권 매수 가능 금액 서버가 요청을 처리하지 못했습니다.",
+                ))
+            }
+            _ => {}
+        }
+        let buying_power = response
+            .json::<TossBuyingPowerEnvelope>()
+            .await
+            .map(|envelope| envelope.result)
+            .map_err(|_| {
+                ApiError::new(
+                    ApiErrorKind::InvalidResponse,
+                    "토스증권 매수 가능 금액 응답 형식이 올바르지 않습니다.",
+                )
+            })?;
+        if buying_power.currency != currency
+            || buying_power.cash_buying_power.is_empty()
+            || buying_power.cash_buying_power.len() > 30
+            || !buying_power
+                .cash_buying_power
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte == b'.' || byte == b'-')
+        {
+            return Err(ApiError::new(
+                ApiErrorKind::InvalidResponse,
+                "토스증권 매수 가능 금액 응답 값이 올바르지 않습니다.",
+            ));
+        }
+        Ok(buying_power)
+    }
+
     async fn request_prices(
         &self,
         access_token: &str,
@@ -1257,12 +1488,105 @@ impl MarketDataBridge {
             })
     }
 
+    async fn request_rankings(
+        &self,
+        access_token: &str,
+        ranking_type: &str,
+        market_country: &str,
+    ) -> Result<TossRankingResult, ApiError> {
+        let count = SCREENER_RANKING_LIMIT.to_string();
+        let response = self
+            .client
+            .get(format!("{API_BASE_URL}/api/v1/rankings"))
+            .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECONDS))
+            .query(&[
+                ("type", ranking_type.to_owned()),
+                ("marketCountry", market_country.to_owned()),
+                ("duration", "1d".to_owned()),
+                ("excludeInvestmentCaution", "true".to_owned()),
+                ("count", count),
+            ])
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(|_| {
+                ApiError::new(
+                    ApiErrorKind::Unavailable,
+                    "토스증권 시장 랭킹 서버에 연결하지 못했습니다.",
+                )
+            })?;
+        match response.status() {
+            StatusCode::UNAUTHORIZED => {
+                return Err(ApiError::new(
+                    ApiErrorKind::Unauthorized,
+                    "토스증권 액세스 토큰이 만료되었습니다.",
+                ))
+            }
+            StatusCode::TOO_MANY_REQUESTS => {
+                return Err(ApiError::new(
+                    ApiErrorKind::RateLimited,
+                    "토스증권 시장 랭킹 조회 한도를 초과했습니다.",
+                ))
+            }
+            StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND => {
+                return Err(ApiError::new(
+                    ApiErrorKind::InvalidResponse,
+                    "시장 랭킹 조회 조건을 확인해 주세요.",
+                ))
+            }
+            status if !status.is_success() => {
+                return Err(ApiError::provider_status(
+                    status,
+                    "토스증권 시장 랭킹 서버가 요청을 처리하지 못했습니다.",
+                ))
+            }
+            _ => {}
+        }
+        response
+            .json::<TossRankingsEnvelope>()
+            .await
+            .map(|envelope| envelope.result)
+            .map_err(|_| {
+                ApiError::new(
+                    ApiErrorKind::InvalidResponse,
+                    "토스증권 시장 랭킹 응답 형식이 올바르지 않습니다.",
+                )
+            })
+    }
+
+    async fn fetch_rankings_with_credentials(
+        &self,
+        credentials: &TossCredentials,
+        ranking_type: &str,
+        market_country: &str,
+    ) -> Result<TossRankingResult, ApiError> {
+        let token = self.token_for(credentials).await?;
+        match self
+            .request_rankings(&token, ranking_type, market_country)
+            .await
+        {
+            Err(error) if error.kind == ApiErrorKind::Unauthorized => {
+                *self.token_cache.lock().map_err(|_| {
+                    ApiError::new(
+                        ApiErrorKind::Unavailable,
+                        "인증 상태를 갱신하지 못했습니다.",
+                    )
+                })? = None;
+                let renewed_token = self.token_for(credentials).await?;
+                self.request_rankings(&renewed_token, ranking_type, market_country)
+                    .await
+            }
+            result => result,
+        }
+    }
+
     async fn request_stock_catalog(
         &self,
         access_token: &str,
         market: &str,
         currency: &str,
     ) -> Result<Vec<StockSearchResult>, ApiError> {
+        self.wait_for_stock_catalog_slot().await?;
         let response = self
             .client
             .get(format!("{API_BASE_URL}/api/v1/stocks/all"))
@@ -1306,9 +1630,21 @@ impl MarketDataBridge {
                     .result
                     .into_iter()
                     .filter_map(|stock| {
+                        let symbol = stock.symbol.filter(|value| {
+                            !value.trim().is_empty()
+                                && value.len() <= 32
+                                && value.bytes().all(|byte| {
+                                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-')
+                                })
+                        })?;
+                        let name = stock.name.filter(|value| {
+                            !value.trim().is_empty()
+                                && value.chars().count() <= 120
+                                && !value.chars().any(char::is_control)
+                        })?;
                         Some(StockSearchResult {
-                            symbol: stock.symbol.filter(|value| !value.trim().is_empty())?,
-                            name: stock.name.filter(|value| !value.trim().is_empty())?,
+                            symbol,
+                            name,
                             market: market.to_owned(),
                             currency: currency.to_owned(),
                             security_type: stock
@@ -1359,19 +1695,7 @@ impl MarketDataBridge {
         };
         let token = self.token_for(credentials).await?;
         let mut stocks = Vec::new();
-        for (index, (market, currency)) in markets.iter().enumerate() {
-            if index > 0 {
-                tauri::async_runtime::spawn_blocking(|| {
-                    std::thread::sleep(Duration::from_millis(1_050))
-                })
-                .await
-                .map_err(|_| {
-                    ApiError::new(
-                        ApiErrorKind::Unavailable,
-                        "종목 목록 조회 간격을 조정하지 못했습니다.",
-                    )
-                })?;
-            }
+        for (market, currency) in markets {
             stocks.extend(self.request_stock_catalog(&token, market, currency).await?);
         }
         stocks.sort_by(|left, right| left.symbol.cmp(&right.symbol));
@@ -1404,11 +1728,27 @@ impl MarketDataBridge {
             let holdings = self
                 .request_holdings(access_token, account.account_seq)
                 .await?;
+            let mut buying_power = Vec::with_capacity(2);
+            let mut buying_power_errors = Vec::new();
+            for currency in ["KRW", "USD"] {
+                match self
+                    .request_buying_power(access_token, account.account_seq, currency)
+                    .await
+                {
+                    Ok(snapshot) => buying_power.push(snapshot),
+                    Err(error) if error.kind == ApiErrorKind::Unauthorized => return Err(error),
+                    Err(error) => {
+                        buying_power_errors.push(format!("{currency}: {}", error.message))
+                    }
+                }
+            }
             result.push(TossAccountOverview {
                 account_alias: format!("ACCOUNT-{}", index + 1),
                 masked_account_no: mask_account_no(&account.account_no),
                 account_type: account.account_type,
                 holdings,
+                buying_power,
+                buying_power_errors,
             });
         }
         Ok(result)
@@ -2120,7 +2460,7 @@ pub async fn toss_account_snapshot(
             "조회 가능한 종합매매 계좌가 없습니다.".to_owned()
         } else {
             format!(
-                "토스증권 계좌 {}개와 보유자산을 읽기 전용으로 확인했습니다.",
+                "토스증권 계좌 {}개와 보유자산·통화별 매수 가능 금액을 읽기 전용으로 확인했습니다.",
                 accounts.len()
             )
         },
@@ -2308,8 +2648,55 @@ fn explicit_kr_stock_from_text(query: &str) -> Option<StockSearchResult> {
     })
 }
 
+fn stock_from_analysis_instrument(
+    instrument: AnalysisInstrumentRequest,
+) -> Result<StockSearchResult, String> {
+    let symbol = instrument.symbol.trim().to_ascii_uppercase();
+    let name = instrument.name.trim().to_owned();
+    let market_country = instrument.market_country.trim().to_ascii_uppercase();
+    let currency = instrument.currency.trim().to_ascii_uppercase();
+    if symbol.is_empty()
+        || symbol.len() > 32
+        || !symbol
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+        || name.is_empty()
+        || name.chars().count() > 120
+        || name.chars().any(char::is_control)
+    {
+        return Err("보유종목 식별 정보가 올바르지 않습니다.".to_owned());
+    }
+    let (market, expected_currency) = match market_country.as_str() {
+        "KR" => ("KRX", "KRW"),
+        "US" => ("US", "USD"),
+        _ => return Err("보유종목 시장은 KR 또는 US만 지원합니다.".to_owned()),
+    };
+    if currency != expected_currency {
+        return Err("보유종목 시장과 통화가 일치하지 않습니다.".to_owned());
+    }
+    Ok(StockSearchResult {
+        symbol,
+        name,
+        market: market.to_owned(),
+        currency,
+        security_type: "STOCK".to_owned(),
+    })
+}
+
 fn average(values: &[f64]) -> Option<f64> {
     (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
+}
+
+fn exponential_moving_average(values: &[f64], period: usize) -> Option<f64> {
+    if values.len() < period || period == 0 {
+        return None;
+    }
+    let multiplier = 2.0 / (period as f64 + 1.0);
+    let mut value = average(&values[..period])?;
+    for next in &values[period..] {
+        value = (*next - value) * multiplier + value;
+    }
+    Some(value)
 }
 
 pub(crate) fn analysis_indicators(bars: &[TossChartBar]) -> AnalysisIndicatorSnapshot {
@@ -2369,14 +2756,82 @@ pub(crate) fn analysis_indicators(bars: &[TossChartBar]) -> AnalysisIndicatorSna
     } else {
         None
     };
+    let (macd_line, macd_signal, macd_histogram) = if closes.len() >= 34 {
+        let macd_values = (26..=closes.len())
+            .filter_map(|end| {
+                let sample = &closes[..end];
+                Some(
+                    exponential_moving_average(sample, 12)?
+                        - exponential_moving_average(sample, 26)?,
+                )
+            })
+            .collect::<Vec<_>>();
+        let line = macd_values.last().copied();
+        let signal = exponential_moving_average(&macd_values, 9);
+        (
+            line,
+            signal,
+            line.zip(signal).map(|(line, signal)| line - signal),
+        )
+    } else {
+        (None, None, None)
+    };
+    let (bollinger_middle, bollinger_upper, bollinger_lower) = if closes.len() >= 20 {
+        let sample = &closes[closes.len() - 20..];
+        let middle = average(sample).unwrap_or_default();
+        let variance = sample
+            .iter()
+            .map(|value| (value - middle).powi(2))
+            .sum::<f64>()
+            / sample.len() as f64;
+        let deviation = variance.sqrt();
+        (
+            Some(middle),
+            Some(middle + deviation * 2.0),
+            Some(middle - deviation * 2.0),
+        )
+    } else {
+        (None, None, None)
+    };
+    let twenty_day_return_volatility_percent = if closes.len() >= 21 {
+        let returns = closes[closes.len() - 21..]
+            .windows(2)
+            .filter_map(|pair| (pair[0] > 0.0).then(|| (pair[1] / pair[0] - 1.0) * 100.0))
+            .collect::<Vec<_>>();
+        average(&returns).map(|mean| {
+            (returns
+                .iter()
+                .map(|value| (value - mean).powi(2))
+                .sum::<f64>()
+                / returns.len() as f64)
+                .sqrt()
+        })
+    } else {
+        None
+    };
     AnalysisIndicatorSnapshot {
         sma_5: sma(5),
         sma_20: sma(20),
         sma_60: sma(60),
         rsi_14,
         atr_14,
+        macd_line,
+        macd_signal,
+        macd_histogram,
+        bollinger_middle,
+        bollinger_upper,
+        bollinger_lower,
+        twenty_day_return_volatility_percent,
         twenty_day_return_percent,
         twenty_day_average_volume,
+    }
+}
+
+fn analysis_technical_availability(completed_bar_count: usize) -> &'static str {
+    if completed_bar_count >= 20 {
+        "available"
+    } else {
+        "insufficient_history"
     }
 }
 
@@ -2458,9 +2913,12 @@ pub async fn toss_analysis_snapshot(
     }
     let credentials = load_credentials()?
         .ok_or_else(|| "토스증권 Open API 연결 정보를 먼저 등록해 주세요.".to_owned())?;
-    let mut candidates = explicit_kr_stock_from_text(query)
-        .into_iter()
-        .collect::<Vec<_>>();
+    let mut candidates = match request.instrument {
+        Some(instrument) => vec![stock_from_analysis_instrument(instrument)?],
+        None => explicit_kr_stock_from_text(query)
+            .into_iter()
+            .collect::<Vec<_>>(),
+    };
     if candidates.is_empty() {
         for market in ["kr", "us"] {
             let stocks = bridge
@@ -2499,6 +2957,7 @@ pub async fn toss_analysis_snapshot(
     let latest_close_minor = latest.close_minor;
     let latest_volume = latest.volume;
     let indicators = analysis_indicators(&completed_bars);
+    let technical_state = analysis_technical_availability(completed_bars.len());
     let (fundamentals, fundamentals_state, fundamentals_missing) = if stock.currency == "USD" {
         match sec_fundamentals::snapshot_for_ticker(&sec_bridge, &stock.symbol, as_of_ms).await {
             Ok(Some(snapshot)) if !snapshot.metrics.is_empty() => {
@@ -2567,6 +3026,15 @@ pub async fn toss_analysis_snapshot(
         "뉴스 공급자 미연결".to_owned(),
         "수급·거시 공급자 미연결".to_owned(),
     ];
+    if technical_state != "available" {
+        missing_data.insert(
+            0,
+            format!(
+                "기술지표 장기 구간 산출 이력 부족: 완료 일봉 {}개 (최소 20개 필요)",
+                completed_bars.len()
+            ),
+        );
+    }
     if let Some(missing) = fundamentals_missing {
         missing_data.insert(0, missing);
     }
@@ -2593,7 +3061,7 @@ pub async fn toss_analysis_snapshot(
         filings,
         availability: AnalysisDataAvailability {
             price: "available".to_owned(),
-            technical: "available".to_owned(),
+            technical: technical_state.to_owned(),
             fundamentals: fundamentals_state.to_owned(),
             filings: filings_state.to_owned(),
             news: "provider_not_connected".to_owned(),
@@ -2601,6 +3069,449 @@ pub async fn toss_analysis_snapshot(
         },
         missing_data,
         bars: completed_bars,
+    })
+}
+
+#[derive(Clone)]
+struct CoarseRankingCandidate {
+    item: TossRankingItem,
+    score_bps: u64,
+    sources: Vec<String>,
+}
+
+fn ranking_weight_bps(preset: &str, ranking_type: &str) -> u64 {
+    match (preset, ranking_type) {
+        ("momentum", "MARKET_TRADING_AMOUNT") => 3_500,
+        ("momentum", "MARKET_TRADING_VOLUME") => 1_500,
+        ("momentum", "TOP_GAINERS") => 5_000,
+        ("reversal", "MARKET_TRADING_AMOUNT") => 3_500,
+        ("reversal", "MARKET_TRADING_VOLUME") => 1_500,
+        ("reversal", "TOP_LOSERS") => 5_000,
+        ("balanced", "MARKET_TRADING_AMOUNT") => 5_000,
+        ("balanced", "MARKET_TRADING_VOLUME") => 2_500,
+        ("balanced", "TOP_GAINERS") => 2_500,
+        _ => 0,
+    }
+}
+
+fn accumulate_ranking_candidates(
+    candidates: &mut BTreeMap<String, CoarseRankingCandidate>,
+    preset: &str,
+    ranking_type: &str,
+    rankings: Vec<TossRankingItem>,
+) -> Result<(), String> {
+    let weight = ranking_weight_bps(preset, ranking_type);
+    if weight == 0 {
+        return Ok(());
+    }
+    for item in rankings {
+        if item.rank == 0 || item.rank > SCREENER_RANKING_LIMIT {
+            return Err("토스증권 시장 랭킹 순위가 허용 범위를 벗어났습니다.".to_owned());
+        }
+        validate_market_symbol(&item.symbol)?;
+        if !matches!(item.currency.as_str(), "KRW" | "USD")
+            || parse_price_minor(&item.price.last_price, &item.currency).is_none()
+            || parse_price_minor(&item.price.base_price, &item.currency).is_none()
+            || item
+                .trading_volume
+                .parse::<f64>()
+                .ok()
+                .is_none_or(|value| !value.is_finite() || value < 0.0)
+            || item
+                .trading_amount
+                .parse::<f64>()
+                .ok()
+                .is_none_or(|value| !value.is_finite() || value < 0.0)
+            || item.price.change_rate.as_deref().is_some_and(|value| {
+                value
+                    .parse::<f64>()
+                    .ok()
+                    .is_none_or(|parsed| !parsed.is_finite())
+            })
+        {
+            return Err(
+                "토스증권 시장 랭킹의 가격·거래량 응답을 안전하게 해석하지 못했습니다.".to_owned(),
+            );
+        }
+        let rank_score = weight.saturating_mul(u64::from(101 - item.rank)) / 100;
+        let entry = candidates
+            .entry(item.symbol.to_ascii_uppercase())
+            .or_insert_with(|| CoarseRankingCandidate {
+                item: item.clone(),
+                score_bps: 0,
+                sources: Vec::new(),
+            });
+        entry.score_bps = entry.score_bps.saturating_add(rank_score).min(10_000);
+        entry.item = item;
+        let source = match ranking_type {
+            "MARKET_TRADING_AMOUNT" => "시장 거래대금",
+            "MARKET_TRADING_VOLUME" => "시장 거래량",
+            "TOP_GAINERS" => "기간 상승률",
+            "TOP_LOSERS" => "기간 하락률",
+            _ => "시장 랭킹",
+        };
+        entry.sources.push(source.to_owned());
+    }
+    Ok(())
+}
+
+fn screener_rules(preset: &str) -> Vec<ScreeningRule> {
+    let mut rules = vec![
+        ScreeningRule {
+            rule_id: "ranking.coarse".to_owned(),
+            metric: "coarse_score_bps".to_owned(),
+            operator: RuleOperator::GreaterOrEqual,
+            threshold: 1,
+            score_weight_bps: 3_000,
+            description: "시장 랭킹 기반 1차 후보입니다.".to_owned(),
+        },
+        ScreeningRule {
+            rule_id: "volume.available".to_owned(),
+            metric: "average_volume_20d".to_owned(),
+            operator: RuleOperator::GreaterOrEqual,
+            threshold: 1,
+            score_weight_bps: 2_000,
+            description: "최근 20거래일 거래량 근거가 있습니다.".to_owned(),
+        },
+    ];
+    match preset {
+        "momentum" => rules.extend([
+            ScreeningRule {
+                rule_id: "momentum.return".to_owned(),
+                metric: "return_20d_bps".to_owned(),
+                operator: RuleOperator::GreaterOrEqual,
+                threshold: 0,
+                score_weight_bps: 2_000,
+                description: "20거래일 수익률이 0% 이상입니다.".to_owned(),
+            },
+            ScreeningRule {
+                rule_id: "momentum.trend".to_owned(),
+                metric: "trend_vs_sma20_bps".to_owned(),
+                operator: RuleOperator::GreaterOrEqual,
+                threshold: 0,
+                score_weight_bps: 2_000,
+                description: "현재가가 20일 이동평균 이상입니다.".to_owned(),
+            },
+            ScreeningRule {
+                rule_id: "momentum.rsi".to_owned(),
+                metric: "rsi_14_bps".to_owned(),
+                operator: RuleOperator::LessOrEqual,
+                threshold: 8_000,
+                score_weight_bps: 1_000,
+                description: "RSI가 80 이하입니다.".to_owned(),
+            },
+        ]),
+        "reversal" => rules.extend([
+            ScreeningRule {
+                rule_id: "reversal.return".to_owned(),
+                metric: "return_20d_bps".to_owned(),
+                operator: RuleOperator::LessOrEqual,
+                threshold: 0,
+                score_weight_bps: 2_500,
+                description: "20거래일 수익률이 0% 이하입니다.".to_owned(),
+            },
+            ScreeningRule {
+                rule_id: "reversal.rsi".to_owned(),
+                metric: "rsi_14_bps".to_owned(),
+                operator: RuleOperator::LessOrEqual,
+                threshold: 4_500,
+                score_weight_bps: 2_500,
+                description: "RSI가 45 이하입니다.".to_owned(),
+            },
+        ]),
+        _ => rules.extend([
+            ScreeningRule {
+                rule_id: "balanced.return".to_owned(),
+                metric: "return_20d_bps".to_owned(),
+                operator: RuleOperator::GreaterOrEqual,
+                threshold: -1_500,
+                score_weight_bps: 2_500,
+                description: "20거래일 낙폭이 -15% 이내입니다.".to_owned(),
+            },
+            ScreeningRule {
+                rule_id: "balanced.rsi".to_owned(),
+                metric: "rsi_14_bps".to_owned(),
+                operator: RuleOperator::LessOrEqual,
+                threshold: 7_500,
+                score_weight_bps: 2_500,
+                description: "RSI가 75 이하입니다.".to_owned(),
+            },
+        ]),
+    }
+    rules
+}
+
+#[tauri::command]
+pub async fn toss_market_screener(
+    request: TossMarketScreenerRequest,
+    bridge: State<'_, MarketDataBridge>,
+) -> Result<TossMarketScreenerResult, String> {
+    let market = request.market.trim().to_ascii_lowercase();
+    let preset = request.preset.trim().to_ascii_lowercase();
+    if !matches!(market.as_str(), "kr" | "us") {
+        return Err("시장 후보 탐색은 국장 또는 미장만 지원합니다.".to_owned());
+    }
+    if !matches!(preset.as_str(), "balanced" | "momentum" | "reversal") {
+        return Err("후보 탐색 기준은 균형·추세·반전 중 하나여야 합니다.".to_owned());
+    }
+    if !(1..=SCREENER_MAX_TECHNICAL_CANDIDATES).contains(&request.technical_candidate_count)
+        || !(1..=SCREENER_MAX_RESULTS).contains(&request.result_count)
+        || request.result_count > request.technical_candidate_count
+    {
+        return Err(
+            "기술 검토는 1~20종목, 최종 후보는 기술 검토 수 이하 1~10종목이어야 합니다.".to_owned(),
+        );
+    }
+    let credentials = load_credentials()?
+        .ok_or_else(|| "토스증권 Open API 연결 정보를 먼저 등록해 주세요.".to_owned())?;
+    let request_started_at_ms = paper_trading::now_ms()?;
+    let market_country = market.to_ascii_uppercase();
+    let ranking_types = [
+        "MARKET_TRADING_AMOUNT",
+        "MARKET_TRADING_VOLUME",
+        "TOP_GAINERS",
+        "TOP_LOSERS",
+    ];
+    let mut coarse = BTreeMap::new();
+    let mut ranked_at = Vec::new();
+    let mut errors = Vec::new();
+    for (index, ranking_type) in ranking_types.iter().enumerate() {
+        if ranking_weight_bps(&preset, ranking_type) == 0 {
+            continue;
+        }
+        if index > 0 {
+            tokio::time::sleep(Duration::from_millis(SCREENER_REQUEST_GAP_MS)).await;
+        }
+        match bridge
+            .fetch_rankings_with_credentials(&credentials, ranking_type, &market_country)
+            .await
+        {
+            Ok(result) => {
+                if let Some(timestamp) = result.ranked_at {
+                    let observed_at_ms = parse_rfc3339_ms(&timestamp).ok_or_else(|| {
+                        "토스증권 시장 랭킹 집계 시각이 올바르지 않습니다.".to_owned()
+                    })?;
+                    if observed_at_ms > request_started_at_ms.saturating_add(300_000) {
+                        return Err("토스증권 시장 랭킹 집계 시각이 미래입니다.".to_owned());
+                    }
+                    ranked_at.push(timestamp);
+                }
+                accumulate_ranking_candidates(&mut coarse, &preset, ranking_type, result.rankings)?;
+            }
+            Err(error) => errors.push(format!("{ranking_type}: {}", error.message)),
+        }
+    }
+    if coarse.is_empty() {
+        return Err(if errors.is_empty() {
+            "현재 집계된 시장 랭킹 후보가 없습니다.".to_owned()
+        } else {
+            format!("시장 랭킹을 불러오지 못했습니다. {}", errors.join(" / "))
+        });
+    }
+    let coarse_universe_count = coarse.len();
+    let stocks = bridge
+        .load_stock_catalog(&credentials, &market)
+        .await
+        .map_err(|error| error.message.to_owned())?;
+    let stock_by_symbol = stocks
+        .into_iter()
+        .map(|stock| (stock.symbol.to_ascii_uppercase(), stock))
+        .collect::<HashMap<_, _>>();
+    let mut coarse_ranked = coarse.into_values().collect::<Vec<_>>();
+    coarse_ranked.sort_by(|left, right| {
+        right
+            .score_bps
+            .cmp(&left.score_bps)
+            .then_with(|| left.item.rank.cmp(&right.item.rank))
+            .then_with(|| left.item.symbol.cmp(&right.item.symbol))
+    });
+    coarse_ranked.truncate(request.technical_candidate_count);
+
+    let now_ms = paper_trading::now_ms()?;
+    let research_market = if market == "kr" {
+        Market::Korea
+    } else {
+        Market::UnitedStates
+    };
+    let mut entries = Vec::new();
+    let mut observations = Vec::new();
+    let mut details = HashMap::new();
+    for (index, coarse_candidate) in coarse_ranked.into_iter().enumerate() {
+        if index > 0 {
+            tokio::time::sleep(Duration::from_millis(SCREENER_REQUEST_GAP_MS)).await;
+        }
+        let symbol = coarse_candidate.item.symbol.to_ascii_uppercase();
+        let Some(stock) = stock_by_symbol.get(&symbol) else {
+            errors.push(format!("{symbol}: 활성 종목 카탈로그에서 찾지 못했습니다."));
+            continue;
+        };
+        let candles = match bridge
+            .fetch_candles_with_credentials(&credentials, &symbol, CandleInterval::OneDay, 80, true)
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                errors.push(format!("{symbol}: {}", error.message));
+                continue;
+            }
+        };
+        let (_, bars) = match chart_bars_from_candles(CandleInterval::OneDay, candles, now_ms) {
+            Ok(value) => value,
+            Err(error) => {
+                errors.push(format!("{symbol}: {error}"));
+                continue;
+            }
+        };
+        let completed = bars
+            .into_iter()
+            .filter(|bar| bar.completed)
+            .collect::<Vec<_>>();
+        let Some(latest) = completed.last() else {
+            errors.push(format!("{symbol}: 완료된 일봉이 없습니다."));
+            continue;
+        };
+        let indicators = analysis_indicators(&completed);
+        let (Some(sma_20), Some(rsi_14), Some(return_20d), Some(average_volume)) = (
+            indicators.sma_20,
+            indicators.rsi_14,
+            indicators.twenty_day_return_percent,
+            indicators.twenty_day_average_volume,
+        ) else {
+            errors.push(format!(
+                "{symbol}: 기술 지표를 만들 완료 일봉이 부족합니다."
+            ));
+            continue;
+        };
+        if sma_20 <= 0.0
+            || !rsi_14.is_finite()
+            || !return_20d.is_finite()
+            || !average_volume.is_finite()
+        {
+            errors.push(format!("{symbol}: 기술 지표 값이 유효하지 않습니다."));
+            continue;
+        }
+        let return_20d_bps = (return_20d * 100.0).round() as i64;
+        let rsi_14_bps = (rsi_14 * 100.0).round() as i64;
+        let trend_vs_sma20_bps =
+            ((latest.close_minor as f64 / sma_20 - 1.0) * 10_000.0).round() as i64;
+        let average_volume_20d = average_volume.round().max(0.0) as u64;
+        entries.push(UniverseEntry {
+            symbol: symbol.clone(),
+            market: research_market,
+            status: InstrumentStatus::Tradable,
+            effective_from_ms: 1,
+            effective_to_ms: None,
+            spread_bps: None,
+            abnormal_spread_bps: 100,
+        });
+        observations.push(ScreeningObservation {
+            symbol: symbol.clone(),
+            market: research_market,
+            observed_at_ms: latest.period_end_ms.min(now_ms),
+            metrics: BTreeMap::from([
+                (
+                    "coarse_score_bps".to_owned(),
+                    coarse_candidate.score_bps as i64,
+                ),
+                (
+                    "average_volume_20d".to_owned(),
+                    average_volume_20d.min(i64::MAX as u64) as i64,
+                ),
+                ("return_20d_bps".to_owned(), return_20d_bps),
+                ("trend_vs_sma20_bps".to_owned(), trend_vs_sma20_bps),
+                ("rsi_14_bps".to_owned(), rsi_14_bps),
+            ]),
+        });
+        details.insert(
+            symbol,
+            (
+                stock.clone(),
+                coarse_candidate,
+                latest.close_minor,
+                return_20d_bps,
+                rsi_14_bps,
+                average_volume_20d,
+            ),
+        );
+    }
+    let technical_evaluated_count = observations.len();
+    if observations.is_empty() {
+        return Err(format!(
+            "기술 검토 가능한 후보가 없습니다. {}",
+            errors.join(" / ")
+        ));
+    }
+    let result = screen_candidates(
+        &UniverseVersion {
+            universe_id: format!("toss-ranking-{market}"),
+            version: 1,
+            active_markets: vec![research_market],
+            entries,
+        },
+        &ScreeningStrategy {
+            strategy_id: format!("toss-{preset}-screen"),
+            version: 1,
+            rules: screener_rules(&preset),
+            maximum_candidates_per_market: request.result_count,
+            analysis_budget: request.result_count,
+            require_spread: false,
+        },
+        now_ms,
+        &observations,
+    )?;
+    let excluded_count = result.excluded.len();
+    let mut candidates = result
+        .candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            let (stock, coarse, latest_price_minor, return_bps, rsi_bps, average_volume) =
+                details.remove(&candidate.symbol)?;
+            let mut reasons = candidate
+                .reasons
+                .into_iter()
+                .filter(|reason| reason.passed)
+                .map(|reason| reason.message)
+                .collect::<Vec<_>>();
+            reasons.push(format!("1차 근거: {}", coarse.sources.join(", ")));
+            Some(TossMarketScreenerCandidate {
+                symbol: candidate.symbol,
+                name: stock.name,
+                market: stock.market,
+                currency: stock.currency,
+                latest_price_minor,
+                coarse_score_bps: coarse.score_bps,
+                screening_score_bps: candidate.score_bps,
+                twenty_day_return_bps: return_bps,
+                rsi_14_bps: rsi_bps,
+                average_volume_20d: average_volume,
+                reasons,
+            })
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        right
+            .screening_score_bps
+            .cmp(&left.screening_score_bps)
+            .then_with(|| right.coarse_score_bps.cmp(&left.coarse_score_bps))
+            .then_with(|| left.symbol.cmp(&right.symbol))
+    });
+    Ok(TossMarketScreenerResult {
+        provider: "TOSS_OPEN_API",
+        market,
+        preset,
+        as_of_ms: now_ms,
+        ranked_at,
+        coarse_universe_count,
+        technical_evaluated_count,
+        excluded_count,
+        candidates,
+        warnings: vec![
+            "현재 활성 종목과 당일 랭킹을 사용한 탐색 결과이며 과거 시점 유니버스 백테스트가 아닙니다.".to_owned(),
+            "후보 단계에서는 호가 스프레드를 유예합니다. 모의주문 검토 전에 최신 호가·장 상태를 다시 확인해야 합니다.".to_owned(),
+            "테마·업종 집중은 사용자 운용 원칙이며 이 탐색기가 임의로 위반 판정하지 않습니다.".to_owned(),
+        ],
+        errors,
+        live_order_enabled: paper_trading::LIVE_ORDER_ENABLED,
     })
 }
 
@@ -2828,6 +3739,34 @@ mod tests {
             .all(|quote| quote.state == "unavailable"));
     }
 
+    #[tokio::test]
+    #[ignore = "연결된 토스증권 자격정보와 공식 시장 랭킹·일봉 서버를 사용하는 읽기 전용 검사"]
+    async fn live_toss_ranked_screener_inputs_are_available() {
+        let credentials = load_credentials()
+            .expect("credential store")
+            .expect("stored Toss credentials");
+        let bridge = MarketDataBridge::default();
+        let ranking = bridge
+            .fetch_rankings_with_credentials(&credentials, "MARKET_TRADING_AMOUNT", "KR")
+            .await
+            .expect("official ranking");
+        assert!(ranking.rankings.len() <= SCREENER_RANKING_LIMIT as usize);
+        let first = ranking.rankings.first().expect("ranked stock");
+        assert!(first.rank > 0);
+        assert_eq!(first.currency, "KRW");
+        let candles = bridge
+            .fetch_candles_with_credentials(
+                &credentials,
+                &first.symbol,
+                CandleInterval::OneDay,
+                80,
+                true,
+            )
+            .await
+            .expect("ranked stock candles");
+        assert!(candles.len() >= 20);
+    }
+
     #[test]
     #[ignore = "연결된 토스증권 자격정보와 외부 네트워크를 사용하는 명시적 통합 검사"]
     fn live_toss_smoke_backtest_uses_real_daily_candles() {
@@ -2968,9 +3907,67 @@ mod tests {
             MarketDataBridge::default().fetch_account_snapshot_with_credentials(&credentials),
         )
         .expect("Toss read-only account snapshot");
+        assert!(!accounts.is_empty());
         assert!(accounts
             .iter()
             .all(|account| account.masked_account_no.contains('*')));
+        assert!(accounts.iter().all(|account| {
+            account.buying_power.len() == 2
+                && account.buying_power_errors.is_empty()
+                && account
+                    .buying_power
+                    .iter()
+                    .all(|item| matches!(item.currency.as_str(), "KRW" | "USD"))
+        }));
+    }
+
+    #[test]
+    #[ignore = "저장된 토스증권 자격정보로 전체 보유종목 코드를 카탈로그 검색 없이 일봉 조회하는 명시적 읽기 전용 검사"]
+    fn live_toss_all_holdings_resolve_directly_to_daily_candles() {
+        let credentials = load_credentials()
+            .expect("credential store")
+            .expect("stored Toss credentials");
+        let bridge = MarketDataBridge::default();
+        let accounts = tauri::async_runtime::block_on(
+            bridge.fetch_account_snapshot_with_credentials(&credentials),
+        )
+        .expect("Toss read-only account snapshot");
+        let holdings = accounts
+            .iter()
+            .flat_map(|account| account.holdings.items.iter())
+            .collect::<Vec<_>>();
+        assert!(!holdings.is_empty());
+        assert!(holdings.len() <= 20);
+        for holding in holdings {
+            let instrument = stock_from_analysis_instrument(AnalysisInstrumentRequest {
+                symbol: holding.symbol.clone(),
+                name: holding.name.clone(),
+                market_country: holding.market_country.clone(),
+                currency: holding.currency.clone(),
+            })
+            .expect("structured holding");
+            let candles = tauri::async_runtime::block_on(bridge.fetch_candles_with_credentials(
+                &credentials,
+                &instrument.symbol,
+                CandleInterval::OneDay,
+                60,
+                true,
+            ))
+            .expect("holding daily candles");
+            assert!(
+                !candles.is_empty(),
+                "holding {} returned no candles",
+                instrument.symbol
+            );
+            assert_eq!(
+                analysis_technical_availability(candles.len()),
+                if candles.len() >= 20 {
+                    "available"
+                } else {
+                    "insufficient_history"
+                }
+            );
+        }
     }
 
     #[test]
@@ -3472,6 +4469,89 @@ mod tests {
     }
 
     #[test]
+    fn structured_holding_accepts_kr_alphanumeric_symbols_without_catalog_lookup() {
+        let stock = stock_from_analysis_instrument(AnalysisInstrumentRequest {
+            symbol: "0220w0".to_owned(),
+            name: "한화 보유 종목".to_owned(),
+            market_country: "KR".to_owned(),
+            currency: "KRW".to_owned(),
+        })
+        .expect("valid KR holding");
+        assert_eq!(stock.symbol, "0220W0");
+        assert_eq!(stock.market, "KRX");
+        assert_eq!(stock.currency, "KRW");
+    }
+
+    #[test]
+    fn structured_holding_rejects_market_currency_mismatch_and_unsafe_symbols() {
+        assert!(stock_from_analysis_instrument(AnalysisInstrumentRequest {
+            symbol: "AAPL".to_owned(),
+            name: "Apple".to_owned(),
+            market_country: "US".to_owned(),
+            currency: "KRW".to_owned(),
+        })
+        .is_err());
+        assert!(stock_from_analysis_instrument(AnalysisInstrumentRequest {
+            symbol: "005930?account=1".to_owned(),
+            name: "삼성전자".to_owned(),
+            market_country: "KR".to_owned(),
+            currency: "KRW".to_owned(),
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn short_listing_history_keeps_price_but_marks_technical_data_insufficient() {
+        assert_eq!(analysis_technical_availability(7), "insufficient_history");
+        assert_eq!(analysis_technical_availability(19), "insufficient_history");
+        assert_eq!(analysis_technical_availability(20), "available");
+    }
+
+    #[test]
+    fn ranking_candidates_are_deduplicated_and_weighted_by_preset() {
+        let item = |rank, symbol: &str| TossRankingItem {
+            rank,
+            symbol: symbol.to_owned(),
+            currency: "KRW".to_owned(),
+            price: TossRankingPrice {
+                last_price: "72000".to_owned(),
+                base_price: "71000".to_owned(),
+                change_rate: Some("0.014084".to_owned()),
+            },
+            trading_volume: "1000000".to_owned(),
+            trading_amount: "72000000000".to_owned(),
+        };
+        let mut candidates = BTreeMap::new();
+        accumulate_ranking_candidates(
+            &mut candidates,
+            "balanced",
+            "MARKET_TRADING_AMOUNT",
+            vec![item(1, "005930")],
+        )
+        .expect("amount ranking");
+        accumulate_ranking_candidates(
+            &mut candidates,
+            "balanced",
+            "MARKET_TRADING_VOLUME",
+            vec![item(2, "005930"), item(1, "000660")],
+        )
+        .expect("volume ranking");
+
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates["005930"].score_bps > candidates["000660"].score_bps);
+        assert_eq!(candidates["005930"].sources.len(), 2);
+    }
+
+    #[test]
+    fn screener_presets_keep_distinct_technical_rules() {
+        let momentum = screener_rules("momentum");
+        let reversal = screener_rules("reversal");
+        assert!(momentum.iter().any(|rule| rule.rule_id == "momentum.trend"));
+        assert!(reversal.iter().any(|rule| rule.rule_id == "reversal.rsi"));
+        assert!(!reversal.iter().any(|rule| rule.rule_id == "momentum.trend"));
+    }
+
+    #[test]
     fn analysis_indicators_use_only_completed_point_in_time_bars() {
         let bars = (0..80)
             .map(|index| TossChartBar {
@@ -3498,6 +4578,13 @@ mod tests {
         assert!(indicators.sma_60.is_some());
         assert!(indicators.rsi_14.is_some());
         assert!(indicators.atr_14.is_some());
+        assert!(indicators.macd_line.is_some());
+        assert!(indicators.macd_signal.is_some());
+        assert!(indicators.macd_histogram.is_some());
+        assert!(indicators.bollinger_middle.is_some());
+        assert!(indicators.bollinger_upper.is_some());
+        assert!(indicators.bollinger_lower.is_some());
+        assert!(indicators.twenty_day_return_volatility_percent.is_some());
         assert_eq!(indicators.twenty_day_average_volume, Some(1_069.5));
     }
 }

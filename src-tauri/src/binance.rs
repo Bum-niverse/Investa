@@ -989,6 +989,7 @@ mod tests {
             AnalysisSnapshotRequest {
                 query: "BTCUSDT 무기한선물".to_owned(),
                 count: 60,
+                instrument: None,
             },
             &BinanceBridge::default(),
         ))

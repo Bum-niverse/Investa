@@ -60,6 +60,12 @@ pub struct ScreeningStrategy {
     pub rules: Vec<ScreeningRule>,
     pub maximum_candidates_per_market: usize,
     pub analysis_budget: usize,
+    #[serde(default = "default_require_spread")]
+    pub require_spread: bool,
+}
+
+const fn default_require_spread() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -225,9 +231,10 @@ pub fn screen_candidates(
                 message: "거래정지·관리·상장폐지 종목은 제외합니다.".to_owned(),
             });
         }
-        if entry
-            .spread_bps
-            .is_none_or(|spread| spread > entry.abnormal_spread_bps)
+        if strategy.require_spread
+            && entry
+                .spread_bps
+                .is_none_or(|spread| spread > entry.abnormal_spread_bps)
         {
             reasons.push(ScreeningReason {
                 rule_id: "universe.spread".to_owned(),
@@ -235,6 +242,14 @@ pub fn screen_candidates(
                 threshold: Some(entry.abnormal_spread_bps as i64),
                 passed: false,
                 message: "스프레드가 없거나 비정상 범위를 넘었습니다.".to_owned(),
+            });
+        } else if !strategy.require_spread && entry.spread_bps.is_none() {
+            reasons.push(ScreeningReason {
+                rule_id: "universe.spread.deferred".to_owned(),
+                observed_value: None,
+                threshold: None,
+                passed: true,
+                message: "후보 탐색 단계에서는 스프레드 검증을 유예하며 주문 적격성 검토 전에 반드시 다시 확인합니다.".to_owned(),
             });
         }
         let observation = observation_map.get(&(market_key.clone(), entry.symbol.as_str()));
@@ -368,6 +383,7 @@ mod tests {
             }],
             maximum_candidates_per_market: 10,
             analysis_budget: 10,
+            require_spread: true,
         }
     }
 
@@ -389,6 +405,32 @@ mod tests {
             .reasons
             .iter()
             .any(|reason| !reason.passed));
+    }
+
+    #[test]
+    fn discovery_can_defer_spread_without_claiming_order_eligibility() {
+        let mut universe = universe();
+        universe.entries[0].spread_bps = None;
+        let mut strategy = strategy();
+        strategy.require_spread = false;
+        let result = screen_candidates(
+            &universe,
+            &strategy,
+            100,
+            &[ScreeningObservation {
+                symbol: "005930".to_owned(),
+                market: Market::Korea,
+                observed_at_ms: 50,
+                metrics: BTreeMap::from([("average_volume".to_owned(), 200)]),
+            }],
+        )
+        .expect("discovery screen");
+
+        assert_eq!(result.candidates.len(), 1);
+        assert!(result.candidates[0]
+            .reasons
+            .iter()
+            .any(|reason| { reason.rule_id == "universe.spread.deferred" && reason.passed }));
     }
 
     #[test]

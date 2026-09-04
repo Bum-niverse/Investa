@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { OperationalReadinessPanel } from "./OperationalReadinessPanel";
 import type { AnalysisMarket } from "./analysisMarket";
+import { buyingPowerEvidence, portfolioPositionEvidence, type MeetingAccountSnapshot } from "./meetingEvidence";
+import { PortfolioOverview, type PortfolioRecordSnapshot } from "./PortfolioOverview";
 
 type Account = { account: { currency: string; cashMinor: number; realizedPnlMinor: number; positions: Record<string, { quantity: number; costBasisMinor: number }>; eventCount: number } };
 type LedgerEvent = Record<string, Record<string, unknown>>;
@@ -53,6 +55,8 @@ export function LedgerWorkspace() {
   const [biasAudit, setBiasAudit] = useState<ExperimentBiasAudit | null>(null);
   const [alertResponses, setAlertResponses] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
+  const [actualPortfolio, setActualPortfolio] = useState<PortfolioRecordSnapshot | null>(null);
+  const [actualPortfolioError, setActualPortfolioError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [policy, setPolicy] = useState({
     policyId: `risk-${Date.now()}`,
@@ -78,7 +82,7 @@ export function LedgerWorkspace() {
     setLoading(true);
     try {
       const refreshedHealth = await invoke<HealthReport>("operations_health_refresh").catch(() => null);
-      const [accountResult, krwEvents, usdEvents, orders, candidateResult, analysisResult, replayResult, overviewResult, engineRunResult, engineCandidateResult, handoffResult, alertResult, reconciliationResult, backupResult] = await Promise.all([
+      const [accountResult, krwEvents, usdEvents, orders, candidateResult, analysisResult, replayResult, overviewResult, engineRunResult, engineCandidateResult, handoffResult, alertResult, reconciliationResult, backupResult, actualPortfolioResult] = await Promise.all([
         invoke<{ accounts: Account[] }>("paper_accounts_status"),
         invoke<LedgerEvent[]>("paper_ledger_history", { currency: "KRW", limit: 100 }),
         invoke<LedgerEvent[]>("paper_ledger_history", { currency: "USD", limit: 100 }),
@@ -92,6 +96,9 @@ export function LedgerWorkspace() {
         invoke<OperationalAlert[]>("operational_alerts"),
         invoke<ReconciliationState>("runtime_reconciliation_status"),
         invoke<BackupInventoryEntry[]>("local_backup_inventory"),
+        invoke<MeetingAccountSnapshot>("toss_account_snapshot")
+          .then((snapshot) => ({ snapshot, error: null }))
+          .catch((reason) => ({ snapshot: null, error: String(reason) })),
       ]);
       setAccounts(accountResult.accounts); setEvents([...krwEvents.map((event) => ({ currency: "KRW", event })), ...usdEvents.map((event) => ({ currency: "USD", event }))]);
       setManualOrders(orders); setCandidates(candidateResult); setAnalyses(analysisResult); setReplayEntries(replayResult.entries); setReplayRuns(replayResult.runs); setEngineOverview(overviewResult); setEngineRuns(engineRunResult); setSelectedReplayId((current) => replayResult.runs.some((run) => run.experimentId === current) ? current : replayResult.runs[0]?.experimentId ?? "");
@@ -99,6 +106,21 @@ export function LedgerWorkspace() {
       setHealthReport(refreshedHealth);
       setReconciliationState(reconciliationResult);
       setBackupInventory(backupResult);
+      if (actualPortfolioResult.snapshot) {
+        const snapshot = actualPortfolioResult.snapshot;
+        setActualPortfolio({
+          provider: snapshot.provider,
+          observedAtMs: snapshot.fetchedAtMs,
+          readOnly: true,
+          positions: portfolioPositionEvidence(snapshot),
+          buyingPower: buyingPowerEvidence(snapshot),
+          warnings: snapshot.accounts.flatMap((account) => account.buyingPowerErrors ?? []),
+        });
+        setActualPortfolioError(null);
+      } else {
+        setActualPortfolio(null);
+        setActualPortfolioError(actualPortfolioResult.error);
+      }
       setLatestEngineReport(engineRunResult[0] ? await invoke<EngineRunReport>("engine_run_detail", { runId: engineRunResult[0].runId }) : null); setError(null);
     } catch (reason) { setError(String(reason)); } finally { setLoading(false); }
   };
@@ -155,12 +177,13 @@ export function LedgerWorkspace() {
   const acknowledgeAlert = async (alert: OperationalAlert) => { const response = alertResponses[alert.alertId]?.trim() ?? ""; if (alert.severity === "critical" && !response) return; try { await invoke("operational_alert_acknowledge", { request: { alertId: alert.alertId, response: response || "운영 화면에서 확인" } }); setAlertResponses((current) => ({ ...current, [alert.alertId]: "" })); await load(); } catch (reason) { setError(String(reason)); } };
 
   return <main className="ledger-workspace">
-    <header className="ledger-header"><div><p className="eyebrow">APPEND-ONLY PAPER LEDGER</p><h2>모의 원장·성과</h2><p>내부 체결 사건과 검증된 백테스트 성과만 표시합니다.</p></div><button type="button" onClick={() => void load()} disabled={loading}>{loading ? "검사 중" : "새로고침"}</button></header>
+    <header className="ledger-header"><div><p className="eyebrow">ASSET & APPEND-ONLY LEDGER</p><h2>보유자산·모의 원장·성과</h2><p>실계좌 보유자산은 읽기 전용으로, 내부 체결과 백테스트는 별도 원장으로 표시합니다.</p></div><button type="button" onClick={() => void load()} disabled={loading}>{loading ? "조회 중" : "전체 새로고침"}</button></header>
     <div className="ledger-tabs" role="tablist"><button role="tab" aria-selected={tab === "ledger"} className={tab === "ledger" ? "is-active" : ""} onClick={() => setTab("ledger")}>원장</button><button role="tab" aria-selected={tab === "performance"} className={tab === "performance" ? "is-active" : ""} onClick={() => setTab("performance")}>성과 분석</button></div>
     {error && <p className="ledger-error" role="alert">{error}</p>}
     {tab === "performance" && meetingHandoffs.length > 0 && <section className="ledger-panels" aria-label="회의 분석 인계 계보"><article><h3>회의 → 백테스트 → 섀도우 후보 계보</h3><p>회의 종합 보고는 주문으로 바로 전송되지 않습니다. 동일 분석 기록을 참조한 백테스트만 연결하며, 현재 신호가 생겨도 사용자 승인 전 내부 모의주문 후보로만 남습니다.</p>{meetingHandoffs.slice(0, 5).map((handoff) => <div className="ledger-order-row" key={handoff.handoffId}><div><strong>{handoff.symbol} · {handoff.status}</strong><span>{handoff.strategy}</span></div><small>{handoff.analysisRecordId} → {handoff.experimentId ?? "백테스트 대기"} → {handoff.paperCandidateId ?? handoff.engineRunId ?? "신호 감시"}{handoff.blocker ? ` · ${handoff.blocker}` : ""}</small></div>)}</article></section>}
     {tab === "performance" && reconciliationState?.candidateActionsLocked !== false && <div className="ledger-error" role="status"><strong>재시작 원장 대사 전 주문 후보 생성·승인이 잠겨 있습니다.</strong> <button type="button" onClick={() => void reconcileRuntime()}>지금 내부 원장 대사</button></div>}
     {tab === "ledger" ? <>
+      {actualPortfolio ? <PortfolioOverview snapshot={actualPortfolio} title="내 보유자산 · 실계좌 읽기 전용" /> : <section className="portfolio-overview"><header><div><span>READ ONLY · TOSS OPEN API</span><h3>내 보유자산</h3></div></header><p className="portfolio-empty">{loading ? "실계좌 보유자산을 조회하고 있습니다." : actualPortfolioError ?? "연결된 실계좌 보유자산이 없습니다."}</p></section>}
       <div className="ledger-tabs" aria-label="원장 출처">
         {([['internal', '내부 체결'], ['manual', '수동 주문'], ['shadow_engine', '섀도우 자동매매'], ['kis', 'KIS 모의'], ['backtest', '백테스트 재생']] as const).map(([id, label]) => <button key={id} type="button" aria-pressed={ledgerSource === id} className={ledgerSource === id ? "is-active" : ""} onClick={() => setLedgerSource(id)}>{label}</button>)}
       </div>

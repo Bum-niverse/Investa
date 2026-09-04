@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "test:frontend": "node --experimental-strip-types --test scripts/workflowRecovery.test.ts scripts/analysisMarket.test.ts scripts/analysisSnapshotRouting.test.ts scripts/technicalChartEvidence.test.ts scripts/connectionStatus.test.ts scripts/connectionRefresh.test.ts scripts/marketStreams.test.ts scripts/meetingEvidence.test.ts scripts/meetingBacktest.test.ts scripts/shadowSoak.test.ts scripts/cloudSoakReport.test.ts",
+    "test:frontend": "node --experimental-strip-types --test scripts/workflowRecovery.test.ts scripts/analysisMarket.test.ts scripts/analysisSnapshotRouting.test.ts scripts/technicalChartEvidence.test.ts scripts/connectionStatus.test.ts scripts/connectionRefresh.test.ts scripts/marketStreams.test.ts scripts/meetingEvidence.test.ts scripts/employeeAgentOrchestration.test.ts scripts/meetingSynthesis.test.ts scripts/externalEvidenceSources.test.ts scripts/portfolioPresentation.test.ts scripts/meetingBacktest.test.ts scripts/shadowSoak.test.ts scripts/cloudSoakReport.test.ts",
     "cloud:soak:collect": "node scripts/cloud_soak_report.mjs",
     "desktop:start": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/launch_investa.ps1",
     "desktop:check": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/launch_investa.ps1 -CheckOnly",

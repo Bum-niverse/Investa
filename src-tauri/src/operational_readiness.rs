@@ -23,7 +23,23 @@ const HEADLESS_SHADOW_SOAK_DURATION_MS: u64 = 86_400_000;
 const HEADLESS_SHADOW_SOAK_SAMPLE_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
+pub enum PortfolioMandate {
+    ObservationOnly,
+    Focused,
+    Thematic,
+    Diversified,
+    Custom,
+}
+
+impl Default for PortfolioMandate {
+    fn default() -> Self {
+        Self::ObservationOnly
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", default)]
 pub struct WorkspacePreferences {
     pub display_timezone: String,
     pub quiet_hours_start: u8,
@@ -31,6 +47,11 @@ pub struct WorkspacePreferences {
     pub stale_after_seconds: u32,
     pub notify_warning: bool,
     pub notify_critical: bool,
+    pub portfolio_mandate: PortfolioMandate,
+    pub concentration_limits_enabled: bool,
+    pub maximum_symbol_exposure_bps: u16,
+    pub maximum_sector_exposure_bps: u16,
+    pub maximum_market_exposure_bps: u16,
 }
 
 impl Default for WorkspacePreferences {
@@ -42,6 +63,11 @@ impl Default for WorkspacePreferences {
             stale_after_seconds: 300,
             notify_warning: true,
             notify_critical: true,
+            portfolio_mandate: PortfolioMandate::ObservationOnly,
+            concentration_limits_enabled: false,
+            maximum_symbol_exposure_bps: 10_000,
+            maximum_sector_exposure_bps: 10_000,
+            maximum_market_exposure_bps: 10_000,
         }
     }
 }
@@ -204,6 +230,12 @@ fn validate_preferences(value: &WorkspacePreferences) -> Result<(), String> {
     }
     if !(30..=86_400).contains(&value.stale_after_seconds) {
         return Err("데이터 만료 기준은 30초~24시간이어야 합니다.".to_owned());
+    }
+    if !(1..=10_000).contains(&value.maximum_symbol_exposure_bps)
+        || !(1..=10_000).contains(&value.maximum_sector_exposure_bps)
+        || !(1..=10_000).contains(&value.maximum_market_exposure_bps)
+    {
+        return Err("포트폴리오 집중 한도는 0.01%~100%여야 합니다.".to_owned());
     }
     Ok(())
 }
@@ -1169,6 +1201,35 @@ pub fn operations_dashboard_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_workspace_preferences_default_to_observation_only() {
+        let legacy = r#"{"displayTimezone":"Asia/Seoul","quietHoursStart":23,"quietHoursEnd":7,"staleAfterSeconds":300,"notifyWarning":true,"notifyCritical":true}"#;
+        let preferences: WorkspacePreferences =
+            serde_json::from_str(legacy).expect("legacy preferences");
+        assert_eq!(
+            preferences.portfolio_mandate,
+            PortfolioMandate::ObservationOnly
+        );
+        assert!(!preferences.concentration_limits_enabled);
+        assert_eq!(preferences.maximum_symbol_exposure_bps, 10_000);
+        validate_preferences(&preferences).expect("safe defaults");
+    }
+
+    #[test]
+    fn enabled_concentration_limits_require_explicit_valid_percentages() {
+        let mut preferences = WorkspacePreferences {
+            concentration_limits_enabled: true,
+            portfolio_mandate: PortfolioMandate::Thematic,
+            maximum_symbol_exposure_bps: 7_500,
+            maximum_sector_exposure_bps: 9_000,
+            maximum_market_exposure_bps: 10_000,
+            ..WorkspacePreferences::default()
+        };
+        validate_preferences(&preferences).expect("explicit thematic limits");
+        preferences.maximum_sector_exposure_bps = 0;
+        assert!(validate_preferences(&preferences).is_err());
+    }
 
     #[test]
     fn cloud_soak_cache_is_fixed_schema_and_live_order_stays_locked() {

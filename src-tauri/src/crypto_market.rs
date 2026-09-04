@@ -1058,6 +1058,7 @@ mod tests {
             AnalysisSnapshotRequest {
                 query: "KRW-BTC 분석".to_owned(),
                 count: 60,
+                instrument: None,
             },
             &CryptoMarketBridge::default(),
         ))

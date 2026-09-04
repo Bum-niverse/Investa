@@ -519,6 +519,7 @@ mod tests {
                 }],
                 maximum_candidates_per_market: 10,
                 analysis_budget: 10,
+                require_spread: true,
             },
             screening_observations: vec![ScreeningObservation {
                 symbol: "005930".to_owned(),

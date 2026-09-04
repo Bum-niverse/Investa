@@ -17,6 +17,12 @@ export type TechnicalChartEvidence = {
   schemaVersion: "2.0"; sourceSnapshotId: string; provider: string; symbol: string; name: string; market: string;
   assetClass: TechnicalChartAssetClass; currency: string; interval: string; adjusted: boolean; asOfMs: number;
   bars: TechnicalChartBar[]; annotations: TechnicalChartAnnotation[]; method: string; warnings: string[];
+  indicators?: {
+    sma5?: number | null; sma20?: number | null; sma60?: number | null; rsi14?: number | null; atr14?: number | null;
+    macdLine?: number | null; macdSignal?: number | null; macdHistogram?: number | null;
+    bollingerMiddle?: number | null; bollingerUpper?: number | null; bollingerLower?: number | null;
+    twentyDayReturnPercent?: number | null; twentyDayAverageVolume?: number | null; twentyDayReturnVolatilityPercent?: number | null;
+  };
 };
 
 type TechnicalSnapshot = Omit<TechnicalChartEvidence, "schemaVersion" | "sourceSnapshotId" | "assetClass" | "bars" | "annotations" | "method" | "warnings"> & {
@@ -116,9 +122,21 @@ export function buildTechnicalChartEvidence(snapshot: TechnicalSnapshot): Techni
   const assetClass = snapshot.assetClass ?? inferTechnicalChartAssetClass(snapshot.market);
   const validation = validatePointInTimeChartBars(snapshot.bars, snapshot.asOfMs, assetClass);
   if (validation.errors.length || validation.bars.length < 20) return null;
-  return { schemaVersion: "2.0", sourceSnapshotId: snapshot.snapshotId, provider: snapshot.provider, symbol: snapshot.symbol, name: snapshot.name, market: snapshot.market, assetClass, currency: snapshot.currency, interval: snapshot.interval, adjusted: snapshot.adjusted, asOfMs: snapshot.asOfMs, bars: validation.bars, annotations: buildTechnicalChartAnnotations(validation.bars, assetClass), method: evidenceMethod(assetClass), warnings: [
+  return { schemaVersion: "2.0", sourceSnapshotId: snapshot.snapshotId, provider: snapshot.provider, symbol: snapshot.symbol, name: snapshot.name, market: snapshot.market, assetClass, currency: snapshot.currency, interval: snapshot.interval, adjusted: snapshot.adjusted, asOfMs: snapshot.asOfMs, bars: validation.bars, annotations: buildTechnicalChartAnnotations(validation.bars, assetClass), indicators: snapshot.indicators, method: evidenceMethod(assetClass), warnings: [
     ...validation.warnings, "표시선은 관측 구간을 설명하는 시각 보조 자료이며 미래 가격 예측이나 주문 신호가 아닙니다.", "수동으로 그린 개인 차트 선과 분리된 불변 분석 기록입니다.",
     ...(assetClass === "securities_future" ? ["연속선물 보정값으로 만기 간 가격 차이를 숨기지 않으며 계약 경계를 넘어 추세선을 연결하지 않습니다."] : []),
     ...(assetClass === "crypto_perpetual" ? ["청산·증거금 판단에는 체결 종가가 아니라 거래소가 제공한 마크가격 계약을 별도로 사용해야 합니다."] : []),
   ] };
+}
+
+export function buildTechnicalChartEvidenceCollection(snapshots: TechnicalSnapshot[]): TechnicalChartEvidence[] {
+  const seen = new Set<string>();
+  return snapshots.flatMap((snapshot) => {
+    const evidence = buildTechnicalChartEvidence(snapshot);
+    if (!evidence) return [];
+    const key = `${evidence.provider}:${evidence.symbol}:${evidence.interval}:${evidence.asOfMs}`;
+    if (seen.has(key)) return [];
+    seen.add(key);
+    return [evidence];
+  });
 }
